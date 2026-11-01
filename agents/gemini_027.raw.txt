@@ -1,0 +1,250 @@
+Here is a complete, self-contained Python trading module designed for your backtesting platform.
+
+### Architecture & Design Approach
+
+1. **Strategy & Alpha Model**:
+   - **Multi-Factor Quantitative Model**: Combines cross-sectional Volatility-Adjusted Momentum, RSI mean-reversion, Bollinger Band Z-score, and Moving Average trend filters.
+   - **Dynamic Selection**: Filters assets by liquidity (20-period average dollar volume) and cross-sectionally ranks top candidates with positive composite alpha scores.
+   - **Inverse-Volatility Sizing**: Allocates target portfolio weights inversely proportional to trailing volatility, ensuring equal risk contribution across held positions and capping individual asset weights to prevent concentration risk.
+
+2. **State & Execution Tracking**:
+   - Since platform orders execute at the *next* bar's `OPEN` price with partial fill rules and no explicit fill reports, the agent simulates exact order execution on the subsequent bar using the new bar's `OPEN` prices.
+   - Internal cash and share balances are updated exactingly: `SELL` orders are processed before `BUY` orders to maximize available liquidity for rebalancing.
+
+3. **Performance & Scalability**:
+   - Time complexity per step is optimized to $O(1)$ relative to total history size by slicing recent trailing windows (`tail`) and vectorizing matrix calculations via pandas pivots. This easily completes full multi-year backtests well within the 60-minute limit.
+
+---
+
+### Implementation Code
+
+```python
+import numpy as np
+import pandas as pd
+
+# Global state dictionary for tracking cash, holdings, and pending orders
+STATE = {
+    'cash': 100000.0,
+    'positions': {},
+    'pending_orders': [],
+}
+
+
+def init(cash: float) -> None:
+    """Initialize agent state before the backtest begins."""
+    global STATE
+    STATE = {
+        'cash': float(cash),
+        'positions': {},
+        'pending_orders': [],
+    }
+
+
+def cross_sectional_zscore(s: pd.Series) -> pd.Series:
+    """Compute cross-sectional Z-score for a series across tickers."""
+    valid = s.dropna()
+    if len(valid) < 2:
+        return pd.Series(0.0, index=s.index)
+    std = valid.std()
+    if std == 0 or pd.isna(std):
+        return pd.Series(0.0, index=s.index)
+    return (s - valid.mean()) / std
+
+
+def compute_rsi(close_df: pd.DataFrame, window: int = 14) -> pd.DataFrame:
+    """Compute RSI across price DataFrame."""
+    delta = close_df.diff()
+    up = delta.clip(lower=0.0)
+    down = -delta.clip(upper=0.0)
+    ma_up = up.rolling(window=window, min_periods=window).mean()
+    ma_down = down.rolling(window=window, min_periods=window).mean()
+    rs = ma_up / (ma_down + 1e-8)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def on_bar(history: pd.DataFrame) -> list:
+    """Process incoming bar data and return order instructions."""
+    global STATE
+
+    if history is None or history.empty:
+        return []
+
+    # Fast slice for recent timestamps to keep memory and execution runtime low
+    history_tail = history.tail(100000)
+    current_ts = history_tail['timestamp'].iloc[-1]
+
+    # Map current bar OPEN prices for pending order execution tracking
+    current_bar_df = history_tail[history_tail['timestamp'] == current_ts]
+    open_prices = dict(zip(current_bar_df['ticker'], current_bar_df['open']))
+
+    # 1. Simulate execution of pending orders submitted on previous bar at current OPEN
+    if STATE['pending_orders']:
+        # Process SELL orders first to release cash
+        for ticker, direction, size in STATE['pending_orders']:
+            if direction == "SELL":
+                p = open_prices.get(ticker)
+                if p is not None and not np.isnan(p) and p > 0:
+                    held = STATE['positions'].get(ticker, 0)
+                    filled = min(size, held)
+                    if filled > 0:
+                        STATE['cash'] += filled * p
+                        STATE['positions'][ticker] = held - filled
+                        if STATE['positions'][ticker] == 0:
+                            del STATE['positions'][ticker]
+
+        # Process BUY orders using available cash
+        for ticker, direction, size in STATE['pending_orders']:
+            if direction == "BUY":
+                p = open_prices.get(ticker)
+                if p is not None and not np.isnan(p) and p > 0:
+                    max_afford = int(STATE['cash'] // p)
+                    filled = min(size, max_afford)
+                    if filled > 0:
+                        STATE['cash'] -= filled * p
+                        STATE['positions'][ticker] = STATE['positions'].get(ticker, 0) + filled
+
+        STATE['pending_orders'] = []
+
+    # 2. Extract recent rolling history for indicator calculations
+    unique_ts = history_tail['timestamp'].unique()
+    lookback_ts = unique_ts[-120:]
+    if len(lookback_ts) < 20:
+        return []
+
+    recent_df = history_tail[history_tail['timestamp'].isin(set(lookback_ts))]
+
+    try:
+        close_df = recent_df.pivot(index='timestamp', columns='ticker', values='close')
+        vol_df = recent_df.pivot(index='timestamp', columns='ticker', values='volume')
+    except Exception:
+        return []
+
+    if close_df.empty or len(close_df) < 20:
+        return []
+
+    latest_close = close_df.iloc[-1]
+    active_tickers = set(current_bar_df['ticker'])
+
+    # 3. Factor & Technical Indicator Calculations
+    ret_20 = close_df.pct_change(20).iloc[-1]
+    
+    log_ret = np.log(close_df / close_df.shift(1))
+    vol_20 = log_ret.rolling(20).std().iloc[-1]
+
+    rsi_df = compute_rsi(close_df, 14)
+    rsi_latest = rsi_df.iloc[-1]
+
+    sma_20 = close_df.rolling(20).mean().iloc[-1]
+    std_20 = close_df.rolling(20).std().iloc[-1]
+    bb_z = (latest_close - sma_20) / (std_20 + 1e-8)
+
+    dol_vol = (close_df * vol_df).rolling(20).mean().iloc[-1]
+
+    # Individual sub-signals
+    sig_mom = ret_20 / (vol_20 + 1e-5)
+    sig_rsi = (50.0 - rsi_latest) / 50.0
+    sig_bb = -bb_z
+    sig_trend = (latest_close / sma_20) - 1.0
+
+    # Composite Z-score forecast
+    z_mom = cross_sectional_zscore(sig_mom)
+    z_rsi = cross_sectional_zscore(sig_rsi)
+    z_bb = cross_sectional_zscore(sig_bb)
+    z_trend = cross_sectional_zscore(sig_trend)
+
+    composite = (
+        0.35 * z_mom.fillna(0) +
+        0.25 * z_rsi.fillna(0) +
+        0.25 * z_bb.fillna(0) +
+        0.15 * z_trend.fillna(0)
+    )
+
+    # 4. Filter Assets and Construct Portfolio Weights
+    valid_mask = (
+        composite.index.isin(active_tickers) &
+        ~latest_close.isna() & (latest_close > 0) &
+        ~vol_20.isna() & (vol_20 > 0) &
+        ~dol_vol.isna() & (dol_vol > 1000)
+    )
+
+    filtered_composite = composite[valid_mask]
+    if filtered_composite.empty:
+        target_weights = pd.Series(0.0, index=list(STATE['positions'].keys()))
+    else:
+        pos_candidates = filtered_composite[filtered_composite > 0]
+        if pos_candidates.empty:
+            target_weights = pd.Series(0.0, index=list(STATE['positions'].keys()))
+        else:
+            top_candidates = pos_candidates.nlargest(8)
+            top_tickers = top_candidates.index
+
+            raw_weights = top_candidates / (vol_20[top_tickers] + 1e-4)
+            if raw_weights.sum() > 0:
+                target_weights = (raw_weights / raw_weights.sum()) * 0.92
+            else:
+                target_weights = pd.Series(0.92 / len(top_tickers), index=top_tickers)
+
+            max_w = min(0.25, 2.0 / len(top_tickers))
+            target_weights = target_weights.clip(upper=max_w)
+
+    # 5. Compute Total Portfolio Value (TPV) & Target Shares
+    portfolio_val = STATE['cash']
+    for t, qty in STATE['positions'].items():
+        if qty > 0 and t in latest_close and not np.isnan(latest_close[t]) and latest_close[t] > 0:
+            portfolio_val += qty * latest_close[t]
+
+    all_tickers = set(STATE['positions'].keys()).union(
+        target_weights.index if not target_weights.empty else []
+    )
+
+    sell_orders = []
+    buy_orders = []
+
+    for t in all_tickers:
+        cur_close = latest_close.get(t, np.nan)
+        if pd.isna(cur_close) or cur_close <= 0:
+            continue
+
+        target_w = target_weights.get(t, 0.0)
+        target_val = portfolio_val * target_w
+        target_shares = int(target_val // cur_close)
+
+        held_shares = STATE['positions'].get(t, 0)
+
+        if target_shares < held_shares:
+            sell_qty = held_shares - target_shares
+            sell_qty = min(sell_qty, held_shares)
+            if sell_qty > 0:
+                sell_orders.append((str(t), "SELL", int(sell_qty)))
+        elif target_shares > held_shares:
+            buy_qty = target_shares - held_shares
+            if buy_qty > 0:
+                buy_orders.append((str(t), "BUY", int(buy_qty), float(cur_close)))
+
+    # 6. Apply Cash Buffer Rules for Buy Orders
+    est_cash = STATE['cash']
+    for t, _, qty in sell_orders:
+        cur_p = latest_close.get(t, 0.0)
+        if cur_p > 0:
+            est_cash += qty * cur_p
+
+    max_buy_cash = max(0.0, est_cash * 0.95)
+    tot_buy_cost = sum(qty * p for _, _, qty, p in buy_orders)
+
+    final_buy_orders = []
+    if tot_buy_cost > max_buy_cash and tot_buy_cost > 0:
+        scale = max_buy_cash / tot_buy_cost
+        for t, direction, qty, p in buy_orders:
+            scaled_qty = int(qty * scale)
+            if scaled_qty > 0:
+                final_buy_orders.append((t, direction, scaled_qty))
+    else:
+        for t, direction, qty, p in buy_orders:
+            if qty > 0:
+                final_buy_orders.append((t, direction, qty))
+
+    # Place SELL orders first in output list
+    orders = sell_orders + final_buy_orders
+    STATE['pending_orders'] = list(orders)
+    return orders
+```

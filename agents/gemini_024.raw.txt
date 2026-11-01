@@ -1,0 +1,400 @@
+An architecture and trading agent implementation for the backtesting platform are described below.
+
+### Strategy & Approach
+
+1. **Alpha Model (Cross-Sectional Momentum + Pullback + Trend Filter):**
+   - **Medium-Term Momentum (20-day return):** Captures multi-week trend momentum across the stock cross-section.
+   - **Short-Term Mean Reversion (5-day return):** Rewards high-momentum stocks experiencing short-term pullbacks (buying dips in uptrends rather than chasing short-term price spikes).
+   - **Trend Filter (20-day Moving Average & RSI):** Ensures candidate stocks trade cleanly near or above their 20-day moving average with RSI $\le 75$ (avoiding buying exhausted, overbought tops).
+   - **Low Volatility Preference:** Prefers stocks with lower recent volatility to favor smoother risk-adjusted upward trends.
+
+2. **Portfolio Sizing & Risk Management:**
+   - **Position Allocation:** Targets up to 6 positions with a maximum allocation of 15% per stock (90% maximum invested capital), retaining a 10% cash buffer to absorb price gaps and execution slippage.
+   - **Trailing Stop & Hard Stop:** Implemented per-position risk controls (12% maximum drawdown stop-loss and an 8% trailing stop once a position gains $\ge 10\%$).
+   - **Exit Hysteresis:** Holds winning positions until their cross-sectional rank drops out of the top 15, preventing excessive turnover and transaction drag.
+
+3. **Execution Tracking & Performance Optimization:**
+   - **Incremental History Data Store:** Maintains per-ticker price queues using fast numpy array slicing, processing only new rows on each `on_bar` call. Execution complexity per bar is $O(1)$ relative to total backtest duration, completing thousands of time steps in seconds.
+   - **Execution Synchronizer:** Because orders submitted on bar $t$ execute on bar $t+1$'s `open` price with partial fill limits, the agent tracks fills at bar $t+1$ against actual execution prices and available cash to keep its internal state synchronized with the platform.
+
+---
+
+### Python Code
+
+```python
+import numpy as np
+import pandas as pd
+
+
+class QuantitativeAgent:
+
+  def __init__(self):
+    self.cash = 0.0
+    self.positions = {}  # ticker -> int shares held
+    self.entry_prices = {}  # ticker -> float average entry price
+    self.peak_prices = {}  # ticker -> float highest price reached since entry
+    self.pending_orders = []  # pending orders from bar t to execute at t+1
+    self.ticker_data = {}  # ticker -> history dict of lists
+    self.last_idx = 0  # row pointer for incremental DataFrame processing
+    self.target_positions = 6
+    self.max_weight_per_stock = 0.15
+    self.min_history_required = 25
+
+  def reset(self, cash: float):
+    self.cash = float(cash)
+    self.positions = {}
+    self.entry_prices = {}
+    self.peak_prices = {}
+    self.pending_orders = []
+    self.ticker_data = {}
+    self.last_idx = 0
+
+  def update_data(self, history: pd.DataFrame) -> pd.DataFrame:
+    """Incrementally ingests history DataFrame and returns the current bar's slice."""
+    if len(history) <= self.last_idx:
+      latest_ts = history['timestamp'].iloc[-1]
+      return history[history['timestamp'] == latest_ts]
+
+    start_idx = self.last_idx
+    self.last_idx = len(history)
+    new_rows = history.iloc[start_idx:]
+
+    t_vals = new_rows['timestamp'].values
+    tick_vals = new_rows['ticker'].values
+    o_vals = new_rows['open'].values
+    h_vals = new_rows['high'].values
+    l_vals = new_rows['low'].values
+    c_vals = new_rows['close'].values
+    v_vals = new_rows['volume'].values
+
+    for t, tick, o, h, l, c, v in zip(
+        t_vals, tick_vals, o_vals, h_vals, l_vals, c_vals, v_vals
+    ):
+      tick = str(tick)
+      if tick not in self.ticker_data:
+        self.ticker_data[tick] = {
+            'close': [],
+            'open': [],
+            'high': [],
+            'low': [],
+            'volume': [],
+        }
+      data = self.ticker_data[tick]
+      data['open'].append(float(o))
+      data['high'].append(float(h))
+      data['low'].append(float(l))
+      data['close'].append(float(c))
+      data['volume'].append(float(v))
+
+      # Cap window length to last 100 bars for memory and execution efficiency
+      if len(data['close']) > 100:
+        data['open'] = data['open'][-100:]
+        data['high'] = data['high'][-100:]
+        data['low'] = data['low'][-100:]
+        data['close'] = data['close'][-100:]
+        data['volume'] = data['volume'][-100:]
+
+    latest_ts = new_rows['timestamp'].iloc[-1]
+    return new_rows[new_rows['timestamp'] == latest_ts]
+
+  def process_pending_orders(self, current_bar: pd.DataFrame):
+    """Simulates platform fill execution for orders submitted at step t-1 using step t open prices."""
+    if not self.pending_orders:
+      return
+
+    current_opens = dict(
+        zip(
+            current_bar['ticker'].astype(str),
+            current_bar['open'].astype(float),
+        )
+    )
+
+    # 1. Process SELL orders first to liquidate capital
+    sells = [o for o in self.pending_orders if o[1] == 'SELL']
+    for ticker, direction, size in sells:
+      if ticker in current_opens:
+        exec_price = current_opens[ticker]
+        if exec_price > 0 and not np.isnan(exec_price):
+          held = self.positions.get(ticker, 0)
+          fill_qty = min(size, held)
+          if fill_qty > 0:
+            self.positions[ticker] = held - fill_qty
+            self.cash += fill_qty * exec_price
+            if self.positions[ticker] == 0:
+              del self.positions[ticker]
+              self.entry_prices.pop(ticker, None)
+              self.peak_prices.pop(ticker, None)
+
+    # 2. Process BUY orders second with budget protection
+    buys = [o for o in self.pending_orders if o[1] == 'BUY']
+    for ticker, direction, size in buys:
+      if ticker in current_opens:
+        exec_price = current_opens[ticker]
+        if exec_price > 0 and not np.isnan(exec_price):
+          max_afford = int(self.cash // exec_price)
+          fill_qty = min(size, max_afford)
+          if fill_qty > 0:
+            prev_qty = self.positions.get(ticker, 0)
+            new_qty = prev_qty + fill_qty
+            self.positions[ticker] = new_qty
+            self.cash -= fill_qty * exec_price
+
+            prev_entry = self.entry_prices.get(ticker, exec_price)
+            self.entry_prices[ticker] = (
+                prev_entry * prev_qty + exec_price * fill_qty
+            ) / new_qty
+            self.peak_prices[ticker] = max(
+                self.peak_prices.get(ticker, exec_price), exec_price
+            )
+
+    self.pending_orders = []
+
+  def update_peak_prices(self, current_bar: pd.DataFrame):
+    """Updates peak high price recorded for held positions to compute trailing stops."""
+    current_closes = dict(
+        zip(
+            current_bar['ticker'].astype(str),
+            current_bar['close'].astype(float),
+        )
+    )
+    for ticker in list(self.positions.keys()):
+      if ticker in current_closes:
+        c = current_closes[ticker]
+        if c > 0 and not np.isnan(c):
+          if ticker in self.peak_prices:
+            self.peak_prices[ticker] = max(self.peak_prices[ticker], c)
+          else:
+            self.peak_prices[ticker] = c
+
+  def generate_orders(self, current_bar: pd.DataFrame) -> list:
+    """Evaluates factors, manages open positions, and generates target buy/sell orders."""
+    current_closes = dict(
+        zip(
+            current_bar['ticker'].astype(str),
+            current_bar['close'].astype(float),
+        )
+    )
+
+    portfolio_value = self.cash
+    for ticker, qty in self.positions.items():
+      if ticker in current_closes:
+        portfolio_value += qty * current_closes[ticker]
+      elif ticker in self.ticker_data and self.ticker_data[ticker]['close']:
+        portfolio_value += qty * self.ticker_data[ticker]['close'][-1]
+
+    metrics = {}
+    for ticker, data in self.ticker_data.items():
+      closes = data['close']
+      vols = data['volume']
+      if len(closes) < self.min_history_required:
+        continue
+      if ticker not in current_closes:
+        continue
+
+      c_curr = current_closes[ticker]
+      if c_curr < 2.0 or np.isnan(c_curr):
+        continue
+
+      c_5 = closes[-5]
+      c_20 = closes[-20]
+      if c_5 <= 0 or c_20 <= 0:
+        continue
+
+      sma_20 = sum(closes[-20:]) / 20.0
+      avg_vol_20 = sum(vols[-20:]) / 20.0
+
+      if c_curr * avg_vol_20 < 10000.0:  # Minimum liquidity filter
+        continue
+
+      rets = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(-20, 0)]
+      mean_ret = sum(rets) / len(rets)
+      vol_20 = (sum((r - mean_ret) ** 2 for r in rets) / len(rets)) ** 0.5
+
+      # 14-period RSI
+      gains, losses = 0.0, 0.0
+      for i in range(-14, 0):
+        diff = closes[i] - closes[i - 1]
+        if diff > 0:
+          gains += diff
+        else:
+          losses -= diff
+      rsi = (
+          50.0
+          if (gains + losses) == 0
+          else 100.0 - (100.0 / (1.0 + (gains / (losses + 1e-8))))
+      )
+
+      # Trend and overbought filters
+      if c_curr < sma_20 * 0.97 or rsi > 75.0:
+        continue
+
+      mom_20 = (c_curr - c_20) / c_20
+      rev_5 = (c_curr - c_5) / c_5
+      trend_20 = (c_curr / sma_20) - 1.0
+
+      metrics[ticker] = {
+          'mom_20': mom_20,
+          'rev_5': rev_5,
+          'trend_20': trend_20,
+          'vol_20': vol_20,
+          'sma_20': sma_20,
+          'c_curr': c_curr,
+      }
+
+    if not metrics:
+      return self.manage_exits_only(current_closes)
+
+    # Standardize factors cross-sectionally
+    moms = np.array([m['mom_20'] for m in metrics.values()])
+    revs = np.array([m['rev_5'] for m in metrics.values()])
+    trends = np.array([m['trend_20'] for m in metrics.values()])
+    vols = np.array([m['vol_20'] for m in metrics.values()])
+
+    def z_score(arr):
+      std = np.std(arr)
+      return (arr - np.mean(arr)) / (std + 1e-6) if std > 1e-8 else np.zeros_like(arr)
+
+    z_moms = z_score(moms)
+    z_revs = z_score(revs)
+    z_trends = z_score(trends)
+    z_vols = z_score(vols)
+
+    scores = {}
+    for i, ticker in enumerate(metrics.keys()):
+      # Composite Score: Momentum (+) + Dip Buy (-) + Trend (+) + Volatility (-)
+      score = (
+          0.40 * z_moms[i]
+          - 0.20 * z_revs[i]
+          + 0.20 * z_trends[i]
+          - 0.20 * z_vols[i]
+      )
+      scores[ticker] = score
+
+    ranked_tickers = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+    rank_map = {t: r for r, t in enumerate(ranked_tickers)}
+
+    retained_positions = []
+    exit_tickers = []
+
+    for ticker in list(self.positions.keys()):
+      if ticker not in current_closes:
+        retained_positions.append(ticker)
+        continue
+
+      c_curr = current_closes[ticker]
+      entry_p = self.entry_prices.get(ticker, c_curr)
+      peak_p = self.peak_prices.get(ticker, c_curr)
+
+      # Exit conditions
+      stop_loss = c_curr < 0.88 * entry_p
+      trailing_stop = (peak_p >= 1.10 * entry_p) and (c_curr < 0.92 * peak_p)
+      sma_20 = metrics.get(ticker, {}).get('sma_20', None)
+      sma_break = (sma_20 is not None) and (c_curr < 0.95 * sma_20)
+      rank = rank_map.get(ticker, 999)
+      rank_drop = rank > 15
+
+      if stop_loss or trailing_stop or sma_break or rank_drop:
+        exit_tickers.append(ticker)
+      else:
+        retained_positions.append(ticker)
+
+    # Fill open portfolio slots with top ranked candidates
+    candidates = [
+        t
+        for t in ranked_tickers
+        if t not in retained_positions and t not in exit_tickers
+    ]
+    slots_needed = self.target_positions - len(retained_positions)
+    new_entries = candidates[: max(0, slots_needed)]
+
+    target_tickers = set(retained_positions + new_entries)
+
+    target_weights = {}
+    num_targets = len(target_tickers)
+    if num_targets > 0:
+      weight_per_stock = min(self.max_weight_per_stock, 0.90 / num_targets)
+      for t in target_tickers:
+        target_weights[t] = weight_per_stock
+
+    sell_orders = []
+    buy_orders = []
+
+    for ticker, qty in list(self.positions.items()):
+      if ticker not in target_tickers:
+        sell_orders.append((str(ticker), 'SELL', int(qty)))
+
+    est_cash = self.cash
+    for ticker, direction, size in sell_orders:
+      if ticker in current_closes:
+        est_cash += size * current_closes[ticker]
+
+    total_buy_cost = 0.0
+    raw_buys = []
+
+    for t in target_tickers:
+      if t not in current_closes:
+        continue
+      c = current_closes[t]
+      if c <= 0 or np.isnan(c):
+        continue
+
+      target_val = portfolio_value * target_weights[t]
+      target_qty = int(target_val // c)
+      current_qty = self.positions.get(t, 0)
+      delta = target_qty - current_qty
+
+      if delta < 0:
+        sell_orders.append((str(t), 'SELL', int(abs(delta))))
+      elif delta > 0:
+        cost = delta * c
+        raw_buys.append((str(t), delta, cost))
+        total_buy_cost += cost
+
+    # Scale buy quantities if total cost exceeds cash safety limit
+    cash_limit = est_cash * 0.95
+    scale = 1.0
+    if total_buy_cost > cash_limit and total_buy_cost > 0:
+      scale = cash_limit / total_buy_cost
+
+    for t, delta, cost in raw_buys:
+      scaled_qty = int(delta * scale)
+      if scaled_qty > 0:
+        buy_orders.append((str(t), 'BUY', int(scaled_qty)))
+
+    all_orders = sell_orders + buy_orders
+    self.pending_orders = all_orders
+    return all_orders
+
+  def manage_exits_only(self, current_closes: dict) -> list:
+    """Fallback risk control manager when no new buy alphas are present."""
+    sell_orders = []
+    for ticker, qty in list(self.positions.items()):
+      if ticker in current_closes:
+        c_curr = current_closes[ticker]
+        entry_p = self.entry_prices.get(ticker, c_curr)
+        peak_p = self.peak_prices.get(ticker, c_curr)
+        if c_curr < 0.88 * entry_p or (
+            peak_p >= 1.10 * entry_p and c_curr < 0.92 * peak_p
+        ):
+          sell_orders.append((str(ticker), 'SELL', int(qty)))
+    self.pending_orders = sell_orders
+    return sell_orders
+
+
+# Instantiate global agent
+agent = QuantitativeAgent()
+
+
+def init(cash: float):
+  """Called exactly once before the first bar."""
+  agent.reset(cash)
+
+
+def on_bar(history: pd.DataFrame) -> list:
+  """Called at each step with append-only price history."""
+  current_bar = agent.update_data(history)
+  agent.process_pending_orders(current_bar)
+  agent.update_peak_prices(current_bar)
+  orders = agent.generate_orders(current_bar)
+  return orders
+```

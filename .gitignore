@@ -1,0 +1,10 @@
+# never commit credentials
+keys.txt
+.env
+# market data (Alpaca data cannot be redistributed; recreate with fetch_tape.py)
+*.parquet
+data/
+chunks/
+# local clutter
+__pycache__/
+.DS_Store

@@ -1,0 +1,7 @@
+model,mean_names_held,mean_names_held,median_hold_bars,median_hold_bars,orders_per_bar,orders_per_bar,flat_frac,flat_frac,tickers_ever_held,tickers_ever_held,concentration_hhi,concentration_hhi
+,mean,std,mean,std,mean,std,mean,std,mean,std,mean,std
+claude,11.773,10.678,11.833,8.526,1.82,0.795,0.025,0.136,372.867,74.501,0.126,0.031
+gemini,6.91,3.278,2.5,2.177,5.988,4.002,0.072,0.254,424.633,124.811,0.162,0.067
+gpt,6.36,2.175,115.633,591.999,1.438,0.643,0.066,0.197,354.867,123.186,0.181,0.162
+popular,11.74,11.43,5.433,4.89,7.055,6.887,0.0,0.0,467.233,31.911,0.132,0.063
+random,12.513,10.867,7.633,8.071,4.929,3.815,0.0,0.0,481.567,11.878,0.108,0.038

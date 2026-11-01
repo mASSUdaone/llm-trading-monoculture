@@ -1,0 +1,7 @@
+group,n_agents,observed_imbalance,null_mean,null_sd,gate_95pct,p_value,z_score,passes,min_traders
+claude,30,0.7533,0.6995,0.0275,0.7432,0.01597,1.96,True,2
+gemini,30,0.6554,0.7002,0.0287,0.7495,0.94611,-1.56,False,2
+gpt,30,0.7725,0.6998,0.0278,0.7438,0.00399,2.62,True,2
+popular,30,0.5906,0.7003,0.0261,0.7407,1.0,-4.2,False,2
+random,30,0.5793,0.7025,0.0276,0.7463,1.0,-4.47,False,2
+ALL,150,0.5669,,,,,,,2

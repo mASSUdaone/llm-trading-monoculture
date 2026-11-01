@@ -1,0 +1,232 @@
+Here is a complete, self-contained Python trading module designed to run within your platform's specifications.
+
+### Architectural Overview & Trading Strategy
+
+1. **Strategy Design**:
+   - **Cross-Sectional Risk-Adjusted Momentum**: Ranks available tickers by their risk-adjusted returns (Sharpe-like momentum score over medium-term lookbacks).
+   - **Trend & Volatility Filters**: Ensures assets are trading above their moving averages to avoid falling knives and filters out extreme volatility spikes.
+   - **Inverse Volatility Portfolio Sizing**: Allocates capital to selected top-ranked assets inversely proportional to their rolling volatility to maintain risk parity.
+   - **Cash & Execution Safety Buffer**: Maintains a safety margin in cash tracking to handle gap openings without order rejections or partial fill failures.
+
+2. **Execution & State Management**:
+   - **Exact Execution Tracking**: Tracks pending orders and updates internal cash and share holdings using actual step $t+1$ execution prices (`open` price of the current bar).
+   - **Performance Slicing**: Slices historical data efficiently on each bar to guarantee completion well within the 60-minute time limit even across long backtest horizons.
+
+---
+
+```python
+import numpy as np
+import pandas as pd
+
+# Global portfolio state variables
+_cash = 0.0
+_positions = {}  # ticker -> int (shares held)
+_pending_orders = []  # list of (ticker, direction, size) submitted at t, executing at t+1 open
+
+
+def init(cash: float) -> None:
+    """Initialize the trading agent state before the first bar."""
+    global _cash, _positions, _pending_orders
+    _cash = float(cash)
+    _positions = {}
+    _pending_orders = []
+
+
+def on_bar(history: pd.DataFrame) -> list[tuple[str, str, int]]:
+    """Process incoming bar data and return a list of trade orders.
+
+    Parameters:
+        history: DataFrame with columns ['timestamp', 'ticker', 'open', 'high', 'low', 'close', 'volume']
+
+    Returns:
+        List of tuples: (ticker, direction, size) where direction is 'BUY' or 'SELL'.
+    """
+    global _cash, _positions, _pending_orders
+
+    if history.empty:
+        return []
+
+    # Get the latest timestamp and bar data
+    latest_ts = history["timestamp"].iloc[-1]
+
+    # Efficiently extract the latest bar slice
+    # Using tail scan for speed
+    latest_bar_df = history[history["timestamp"] == latest_ts]
+
+    # Build quick lookup dicts for the current bar's prices
+    current_opens = dict(zip(latest_bar_df["ticker"], latest_bar_df["open"]))
+    current_closes = dict(zip(latest_bar_df["ticker"], latest_bar_df["close"]))
+
+    # ------------------------------------------------------------------
+    # 1. Update Portfolio State from Orders Executed at Current Bar Open
+    # ------------------------------------------------------------------
+    if _pending_orders:
+        for ticker, direction, size in _pending_orders:
+            if ticker not in current_opens or size <= 0:
+                continue
+
+            open_price = current_opens[ticker]
+            if np.isnan(open_price) or open_price <= 0:
+                continue
+
+            if direction == "BUY":
+                # Cap fill by available cash
+                max_affordable = int(_cash // open_price)
+                filled_qty = min(size, max_affordable)
+                if filled_qty > 0:
+                    cost = filled_qty * open_price
+                    _cash -= cost
+                    _positions[ticker] = _positions.get(ticker, 0) + filled_qty
+            elif direction == "SELL":
+                # Cap fill by held shares
+                held_qty = _positions.get(ticker, 0)
+                filled_qty = min(size, held_qty)
+                if filled_qty > 0:
+                    revenue = filled_qty * open_price
+                    _cash += revenue
+                    _positions[ticker] = held_qty - filled_qty
+                    if _positions[ticker] <= 0:
+                        _positions.pop(ticker, None)
+
+        _pending_orders = []
+
+    # ------------------------------------------------------------------
+    # 2. Extract Recent Data Window for Signal Generation
+    # ------------------------------------------------------------------
+    # Take up to the last 120 distinct timestamps for efficient calculation
+    unique_ts = history["timestamp"].drop_duplicates()
+    lookback_bars = min(len(unique_ts), 120)
+
+    if lookback_bars < 15:
+        # Require minimal historical context before entering positions
+        return []
+
+    cutoff_ts = unique_ts.iloc[-lookback_bars]
+    recent_df = history[history["timestamp"] >= cutoff_ts]
+
+    # Pivot close prices: rows = timestamps, columns = tickers
+    price_pivot = recent_df.pivot(
+        index="timestamp", columns="ticker", values="close"
+    )
+
+    if price_pivot.empty:
+        return []
+
+    # Calculate returns and risk metrics across available tickers
+    latest_prices = price_pivot.iloc[-1]
+    valid_tickers = latest_prices.dropna().index.tolist()
+
+    scores = {}
+    volatilities = {}
+
+    for ticker in valid_tickers:
+        series = price_pivot[ticker].dropna()
+        if len(series) < 15:
+            continue
+
+        curr_p = series.iloc[-1]
+        if curr_p <= 0 or np.isnan(curr_p):
+            continue
+
+        # Returns over short and medium windows
+        ret_15 = (curr_p / series.iloc[-15]) - 1.0
+        ret_full = (
+            (curr_p / series.iloc[0]) - 1.0 if len(series) >= 40 else ret_15
+        )
+
+        # Log daily returns for volatility calculation
+        daily_returns = np.diff(np.log(series.values))
+        if len(daily_returns) < 5:
+            continue
+
+        vol = np.std(daily_returns)
+        if vol <= 1e-6 or np.isnan(vol):
+            continue
+
+        # Trend filter: ensure price is above 15-period simple moving average
+        sma_15 = series.iloc[-15:].mean()
+        if curr_p < sma_15:
+            continue
+
+        # Momentum score = blend of short and medium term return scaled by volatility
+        score = (0.6 * ret_15 + 0.4 * ret_full) / vol
+        if score > 0:
+            scores[ticker] = score
+            volatilities[ticker] = vol
+
+    # ------------------------------------------------------------------
+    # 3. Portfolio Allocation & Target Sizing
+    # ------------------------------------------------------------------
+    # Select top K assets (e.g., top 5)
+    max_assets = 5
+    sorted_tickers = sorted(scores.keys(), key=lambda t: scores[t], reverse=True)
+    selected_tickers = sorted_tickers[:max_assets]
+
+    # Calculate current total portfolio equity
+    portfolio_equity = _cash
+    for t, qty in _positions.items():
+        p = current_closes.get(t, 0.0)
+        if not np.isnan(p) and p > 0:
+            portfolio_equity += qty * p
+
+    # Target weights based on inverse volatility weighting
+    target_shares = {}
+    if selected_tickers:
+        inv_vols = {t: 1.0 / volatilities[t] for t in selected_tickers}
+        total_inv_vol = sum(inv_vols.values())
+        weights = {t: inv_vols[t] / total_inv_vol for t in selected_tickers}
+
+        # Reserve 2% cash cushion for safety against open gap slippage
+        usable_equity = portfolio_equity * 0.98
+
+        for t in selected_tickers:
+            target_val = usable_equity * weights[t]
+            p = current_closes.get(t, 0.0)
+            if p > 0 and not np.isnan(p):
+                target_shares[t] = int(target_val // p)
+            else:
+                target_shares[t] = 0
+
+    # Tickers not selected should have target size 0 (liquidate)
+    for t in _positions:
+        if t not in target_shares:
+            target_shares[t] = 0
+
+    # ------------------------------------------------------------------
+    # 4. Generate Orders (Sells first to release capital, then Buys)
+    # ------------------------------------------------------------------
+    orders = []
+    estimated_cash = _cash
+
+    # Generate SELL orders first
+    for ticker, target_qty in target_shares.items():
+        current_qty = _positions.get(ticker, 0)
+        if current_qty > target_qty:
+            sell_qty = current_qty - target_qty
+            if sell_qty > 0:
+                orders.append((ticker, "SELL", int(sell_qty)))
+                p = current_closes.get(ticker, 0.0)
+                if p > 0 and not np.isnan(p):
+                    estimated_cash += sell_qty * p
+
+    # Generate BUY orders
+    for ticker, target_qty in target_shares.items():
+        current_qty = _positions.get(ticker, 0)
+        if target_qty > current_qty:
+            buy_qty = target_qty - current_qty
+            p = current_closes.get(ticker, 0.0)
+            if p > 0 and not np.isnan(p):
+                cost = buy_qty * p
+                # Scale down buy quantity if estimated cash is insufficient
+                if cost > estimated_cash and estimated_cash > 0:
+                    buy_qty = int(estimated_cash // p)
+
+                if buy_qty > 0:
+                    orders.append((ticker, "BUY", int(buy_qty)))
+                    estimated_cash -= buy_qty * p
+
+    # Store pending orders for state tracking on the next bar
+    _pending_orders = list(orders)
+
+    return orders
+```

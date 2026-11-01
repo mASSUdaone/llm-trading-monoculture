@@ -1,0 +1,16 @@
+measure,group,size,unweighted,weighted
+pairwise_jaccard,claude,435,0.1943,0.1455
+pairwise_jaccard,gemini,378,0.1432,0.107
+pairwise_jaccard,gpt,406,0.2264,0.188
+pairwise_jaccard,all_llm,3741,0.1485,0.1136
+pairwise_jaccard,random,435,0.012,0.0093
+pairwise_jaccard,popular,435,0.0146,0.0107
+effective_names,claude,30,45.67,28.69
+effective_names,gemini,28,30.88,26.53
+effective_names,gpt,29,18.61,16.76
+effective_names,mixed,30,37.22,28.11
+effective_names,all_llm,87,39.64,30.03
+effective_names,random,30,215.6,177.64
+effective_names,popular,30,180.32,138.64
+effective_names_mixed_range_unweighted,mixed,30,27.18,52.14
+effective_names_mixed_range_weighted,mixed,30,23.96,32.75

@@ -1,0 +1,373 @@
+import math
+from collections import defaultdict, deque
+
+import numpy as np
+
+
+# Account and execution state
+_cash = 0.0
+_positions = {}
+_entry_price = {}
+_pending_orders = []
+_queued_buys = []
+
+# Market-data state
+_price_volume_history = defaultdict(lambda: deque(maxlen=75))
+_seen_rows = 0
+_bar_number = 0
+
+# Strategy parameters
+_MAX_POSITIONS = 5
+_REBALANCE_EVERY = 5
+_MIN_HISTORY = 65
+_STOP_LOSS = 0.88
+_BUY_CASH_FRACTION = 0.60
+
+
+def init(cash):
+    """
+    Called once by the platform before the first bar.
+    """
+    global _cash, _positions, _entry_price, _pending_orders, _queued_buys
+    global _price_volume_history, _seen_rows, _bar_number
+
+    _cash = float(cash)
+    _positions = {}
+    _entry_price = {}
+    _pending_orders = []
+    _queued_buys = []
+
+    _price_volume_history = defaultdict(lambda: deque(maxlen=75))
+    _seen_rows = 0
+    _bar_number = 0
+
+
+def _valid_price(value):
+    try:
+        return np.isfinite(value) and float(value) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _apply_pending_fills(current_rows):
+    """
+    Reconstruct fills ourselves because the platform does not provide fills.
+
+    Pending orders submitted on the previous call execute at this bar's open.
+    Sells are processed before buys. The strategy deliberately avoids normally
+    submitting sells and buys together, so this ordering is conservative and
+    keeps internal account state close to platform state.
+    """
+    global _cash, _positions, _entry_price, _pending_orders
+
+    if not _pending_orders:
+        return
+
+    open_prices = {}
+
+    for row in current_rows.itertuples(index=False):
+        ticker = row.ticker
+        price = row.open
+        if _valid_price(price):
+            open_prices[ticker] = float(price)
+
+    # Process sells first.
+    for ticker, direction, quantity in _pending_orders:
+        if direction != "SELL":
+            continue
+
+        price = open_prices.get(ticker)
+        held = _positions.get(ticker, 0)
+
+        if price is None or held <= 0:
+            continue
+
+        filled = min(int(quantity), int(held))
+        if filled <= 0:
+            continue
+
+        _cash += filled * price
+        remaining = held - filled
+
+        if remaining <= 0:
+            _positions.pop(ticker, None)
+            _entry_price.pop(ticker, None)
+        else:
+            _positions[ticker] = remaining
+
+    # Then process buys in the same order returned to the platform.
+    for ticker, direction, quantity in _pending_orders:
+        if direction != "BUY":
+            continue
+
+        price = open_prices.get(ticker)
+        if price is None:
+            continue
+
+        affordable = int(_cash // price)
+        filled = min(int(quantity), affordable)
+
+        if filled <= 0:
+            continue
+
+        old_shares = _positions.get(ticker, 0)
+        old_cost_basis = _entry_price.get(ticker, price)
+
+        new_shares = old_shares + filled
+        new_basis = (
+            (old_shares * old_cost_basis + filled * price) / new_shares
+        )
+
+        _cash -= filled * price
+        _positions[ticker] = new_shares
+        _entry_price[ticker] = new_basis
+
+    _pending_orders = []
+
+
+def _update_history(current_rows):
+    """
+    Keep a compact rolling close/volume history per ticker. This avoids
+    repeatedly scanning the full history DataFrame on every bar.
+    """
+    for row in current_rows.itertuples(index=False):
+        close = row.close
+        volume = row.volume
+
+        if not _valid_price(close):
+            continue
+
+        try:
+            volume = float(volume)
+        except (TypeError, ValueError):
+            volume = 0.0
+
+        if not np.isfinite(volume) or volume < 0:
+            volume = 0.0
+
+        _price_volume_history[row.ticker].append((float(close), volume))
+
+
+def _current_close_map(current_rows):
+    closes = {}
+
+    for row in current_rows.itertuples(index=False):
+        if _valid_price(row.close):
+            closes[row.ticker] = float(row.close)
+
+    return closes
+
+
+def _rank_candidates():
+    """
+    Cross-sectional trend / momentum ranking.
+
+    A ticker is eligible when it has:
+      - at least 65 observations,
+      - positive medium-term momentum,
+      - price above both its 20-bar and 60-bar moving average,
+      - usable recent dollar volume.
+
+    Score rewards 20- and 60-bar momentum and penalizes volatility.
+    """
+    candidates = []
+
+    for ticker, observations in _price_volume_history.items():
+        if len(observations) < _MIN_HISTORY:
+            continue
+
+        data = np.asarray(observations, dtype=float)
+        closes = data[:, 0]
+        volumes = data[:, 1]
+
+        latest = closes[-1]
+        if not _valid_price(latest):
+            continue
+
+        close_20_ago = closes[-21]
+        close_60_ago = closes[-61]
+
+        if close_20_ago <= 0 or close_60_ago <= 0:
+            continue
+
+        ma20 = float(np.mean(closes[-20:]))
+        ma60 = float(np.mean(closes[-60:]))
+
+        if ma20 <= 0 or ma60 <= 0:
+            continue
+
+        momentum_20 = latest / close_20_ago - 1.0
+        momentum_60 = latest / close_60_ago - 1.0
+
+        log_returns = np.diff(np.log(closes[-21:]))
+        volatility = float(np.std(log_returns)) if len(log_returns) else 0.0
+
+        dollar_volume = float(np.median(closes[-20:] * volumes[-20:]))
+
+        # Avoid very illiquid names where opening prices may be unreliable.
+        if dollar_volume < 100000.0:
+            continue
+
+        # Trend filter.
+        if latest <= ma20 or latest <= ma60:
+            continue
+
+        if momentum_20 <= 0.0 or momentum_60 <= 0.0:
+            continue
+
+        # Favor persistent momentum while discouraging unstable price series.
+        score = (
+            0.55 * momentum_20
+            + 0.35 * momentum_60
+            + 0.10 * (latest / ma20 - 1.0)
+            - 1.50 * volatility
+        )
+
+        candidates.append((score, ticker))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return [ticker for _, ticker in candidates[:_MAX_POSITIONS]]
+
+
+def _stop_loss_orders(closes):
+    """
+    Hard stop-loss protection checked every bar, not only on rebalance bars.
+    """
+    orders = []
+
+    for ticker, shares in list(_positions.items()):
+        close = closes.get(ticker)
+        entry = _entry_price.get(ticker)
+
+        if close is None or entry is None or entry <= 0:
+            continue
+
+        if close <= entry * _STOP_LOSS:
+            orders.append((ticker, "SELL", int(shares)))
+
+    return orders
+
+
+def _make_buy_orders(closes):
+    """
+    Turn queued candidate names into buy orders.
+
+    Purchases intentionally use only part of cash and are made only after any
+    previous rebalance sells have had time to execute. This leaves a buffer for
+    overnight gaps between the signal close and next-bar opening execution.
+    """
+    global _queued_buys
+
+    if not _queued_buys or _cash <= 0:
+        return []
+
+    current_positions = len(_positions)
+    available_slots = max(0, _MAX_POSITIONS - current_positions)
+
+    if available_slots <= 0:
+        _queued_buys = []
+        return []
+
+    names = []
+    seen = set()
+
+    for ticker in _queued_buys:
+        if ticker in seen:
+            continue
+        seen.add(ticker)
+
+        if ticker in _positions:
+            continue
+
+        price = closes.get(ticker)
+        if price is None or price <= 0:
+            continue
+
+        names.append(ticker)
+
+        if len(names) >= available_slots:
+            break
+
+    _queued_buys = []
+
+    if not names:
+        return []
+
+    budget_per_name = (_cash * _BUY_CASH_FRACTION) / len(names)
+    orders = []
+
+    for ticker in names:
+        price = closes[ticker]
+        shares = int(budget_per_name // price)
+
+        if shares > 0:
+            orders.append((ticker, "BUY", shares))
+
+    return orders
+
+
+def on_bar(history):
+    """
+    Main trading callback.
+
+    Strategy:
+      1. Maintain rolling price/volume histories.
+      2. Rebalance every five bars into up to five liquid, strong-trend names.
+      3. Use 20-bar and 60-bar momentum, moving-average confirmation, and a
+         volatility penalty for ranking.
+      4. Exit names that fall out of the selected set on rebalance.
+      5. Apply a 12% hard stop loss on every bar.
+      6. Sell first and defer purchases until a later bar, minimizing reliance
+         on same-bar sell proceeds and unknown opening prices.
+    """
+    global _seen_rows, _bar_number, _pending_orders, _queued_buys
+
+    if history is None or len(history) == 0:
+        return []
+
+    # The platform supplies append-only history. Only process newly appended
+    # rows rather than rescanning the full DataFrame every bar.
+    if _seen_rows >= len(history):
+        return []
+
+    current_rows = history.iloc[_seen_rows:]
+    _seen_rows = len(history)
+    _bar_number += 1
+
+    # Orders submitted last bar execute at this bar's open.
+    _apply_pending_fills(current_rows)
+
+    # Current bar close becomes available after the open execution.
+    _update_history(current_rows)
+    closes = _current_close_map(current_rows)
+
+    # Risk management has priority over queued entries.
+    orders = _stop_loss_orders(closes)
+
+    # Rebalance periodically after sufficient indicator history exists.
+    if _bar_number >= _MIN_HISTORY and _bar_number % _REBALANCE_EVERY == 0:
+        selected = set(_rank_candidates())
+
+        already_selling = {ticker for ticker, direction, _ in orders
+                           if direction == "SELL"}
+
+        # Remove holdings that no longer qualify for the top-ranked portfolio.
+        for ticker, shares in list(_positions.items()):
+            if ticker not in selected and ticker not in already_selling:
+                orders.append((ticker, "SELL", int(shares)))
+                already_selling.add(ticker)
+
+        # Queue new candidates. They will be bought on a later bar after sells
+        # have had an opportunity to fill.
+        _queued_buys = [
+            ticker for ticker in selected
+            if ticker not in _positions
+        ]
+
+    # Do not mix stop/rebalance sells with fresh buys in one submission.
+    if not orders:
+        orders = _make_buy_orders(closes)
+
+    # Save submitted orders so their next-bar fills can be reconstructed.
+    _pending_orders = list(orders)
+    return orders

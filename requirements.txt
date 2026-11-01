@@ -1,0 +1,9 @@
+pandas
+numpy
+scipy
+matplotlib
+pyarrow
+alpaca-py
+anthropic
+google-genai
+openai

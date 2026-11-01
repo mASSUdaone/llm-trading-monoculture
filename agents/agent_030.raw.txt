@@ -1,0 +1,196 @@
+# Design
+
+**Strategy: volatility‑scaled cross‑sectional momentum with a trend filter**
+
+- Every `REBALANCE_PERIOD` bars, rank all tickers that are in an uptrend (price above its own long‑term SMA) by trailing momentum (return over a lookback window).
+- Take the top‑K momentum names, size them by inverse recent volatility (risk parity–ish), cap any single name's weight, and keep a cash buffer.
+- Turn target weights into target share counts using the latest close, diff against currently-held shares, and emit SELL orders (to free/trim cash) before BUY orders.
+- On bars that aren't rebalance bars, do nothing (reduces order volume, keeps it fast).
+- If nothing passes the trend filter (broad downturn), go to cash.
+
+**State tracking problem:** the platform gives no fill confirmations, balances, or positions. So the module keeps its own internal ledger (`cash`, `positions`) and **replicates the platform's exact execution semantics** (fill at next bar's open, partial fill by affordability/holdings, zero fill if price missing) to keep that ledger in sync with reality. Orders decided in `on_bar` at step *t* are stored as "pending" and applied against step *t+1*'s open the moment that bar arrives — mirroring how the platform will actually execute them — before any new decisions are made.
+
+Position sizing always respects the internally-tracked cash/holdings (never sizing to more than currently believed available), and a cash buffer is kept so estimation error (price moved between decision and next-open fill) rarely causes unwanted partial fills.
+
+```python
+import numpy as np
+import pandas as pd
+
+# ----------------------------- Config -----------------------------
+REBALANCE_PERIOD   = 5      # rebalance every N bars
+LOOKBACK_MOM        = 60    # momentum lookback (bars)
+LOOKBACK_TREND      = 100   # trend filter SMA lookback (bars)
+LOOKBACK_VOL        = 20    # volatility lookback (bars)
+TOP_K               = 10    # number of names to hold
+MAX_WEIGHT          = 0.15  # cap per-name weight
+CASH_BUFFER         = 0.05  # fraction of equity kept uninvested
+MIN_TRADE_VALUE     = 50.0  # skip trades smaller than this $ amount
+
+# ----------------------------- State -----------------------------
+_state = {
+    "cash": 0.0,
+    "positions": {},        # ticker -> int shares
+    "pending_orders": [],   # orders submitted last bar, to fill at this bar's open
+    "bar_count": 0,
+}
+
+
+def init(cash):
+    global _state
+    _state = {
+        "cash": float(cash),
+        "positions": {},
+        "pending_orders": [],
+        "bar_count": 0,
+    }
+
+
+def _apply_fills(current_bar_df):
+    """Simulate execution of pending orders at this bar's open, mirroring
+    the platform's fill rules exactly, to keep our internal ledger correct."""
+    if not _state["pending_orders"]:
+        return
+
+    price_map = dict(zip(current_bar_df["ticker"], current_bar_df["open"]))
+
+    for ticker, direction, size in _state["pending_orders"]:
+        price = price_map.get(ticker)
+        if price is None or pd.isna(price) or price <= 0:
+            continue  # no price available -> zero fill
+
+        if direction == "BUY":
+            affordable = int(_state["cash"] // price)
+            qty = min(size, affordable)
+            if qty > 0:
+                _state["cash"] -= qty * price
+                _state["positions"][ticker] = _state["positions"].get(ticker, 0) + qty
+
+        elif direction == "SELL":
+            held = _state["positions"].get(ticker, 0)
+            qty = min(size, held)
+            if qty > 0:
+                _state["cash"] += qty * price
+                remaining = held - qty
+                if remaining > 0:
+                    _state["positions"][ticker] = remaining
+                else:
+                    _state["positions"].pop(ticker, None)
+
+    _state["pending_orders"] = []
+
+
+def _compute_rebalance_orders(history):
+    try:
+        timestamps = pd.Index(history["timestamp"].unique()).sort_values()
+        lookback = max(LOOKBACK_MOM, LOOKBACK_TREND, LOOKBACK_VOL) + 5
+        recent_ts = timestamps[-lookback:] if len(timestamps) >= lookback else timestamps
+        recent = history[history["timestamp"].isin(recent_ts)]
+
+        pivot_close = recent.pivot_table(index="timestamp", columns="ticker", values="close")
+        pivot_close = pivot_close.sort_index()
+
+        if pivot_close.shape[0] < LOOKBACK_TREND:
+            return []
+
+        last_prices = pivot_close.iloc[-1]
+        sma_trend = pivot_close.tail(LOOKBACK_TREND).mean()
+        mom_ret = pivot_close.iloc[-1] / pivot_close.iloc[-LOOKBACK_MOM] - 1.0
+
+        rets = pivot_close.pct_change()
+        vol = rets.tail(LOOKBACK_VOL).std()
+
+        eligible = (
+            last_prices.notna()
+            & sma_trend.notna()
+            & (last_prices > sma_trend)
+            & vol.notna()
+            & (vol > 1e-6)
+            & mom_ret.notna()
+        )
+
+        candidates = mom_ret[eligible].sort_values(ascending=False)
+        top = candidates.head(TOP_K)
+
+        equity = _state["cash"]
+        for t, sh in _state["positions"].items():
+            p = last_prices.get(t, np.nan)
+            if not pd.isna(p):
+                equity += sh * p
+
+        target_shares = {}
+        if len(top) > 0:
+            inv_vol = 1.0 / vol[top.index]
+            weights = inv_vol / inv_vol.sum()
+            weights = weights.clip(upper=MAX_WEIGHT)
+            wsum = weights.sum()
+            if wsum > 0:
+                weights = weights / wsum
+            weights = weights * (1.0 - CASH_BUFFER)
+
+            for t in top.index:
+                price = last_prices[t]
+                if price > 0:
+                    dollar = weights[t] * equity
+                    target_shares[t] = int(dollar // price)
+
+        current_positions = dict(_state["positions"])
+        all_tickers = set(current_positions.keys()) | set(target_shares.keys())
+
+        sell_orders = []
+        buy_orders = []
+
+        for t in all_tickers:
+            cur = current_positions.get(t, 0)
+            tgt = target_shares.get(t, 0)
+            diff = tgt - cur
+            if diff == 0:
+                continue
+
+            price = last_prices.get(t, np.nan)
+            value = abs(diff) * price if not pd.isna(price) else 0.0
+
+            if diff < 0:
+                if value >= MIN_TRADE_VALUE or tgt == 0:
+                    sell_orders.append((t, "SELL", int(abs(diff))))
+            else:
+                if value >= MIN_TRADE_VALUE:
+                    buy_orders.append((t, "BUY", int(diff)))
+
+        return sell_orders + buy_orders
+
+    except Exception:
+        # Never let a computation error crash the whole run.
+        return []
+
+
+def on_bar(history):
+    global _state
+    _state["bar_count"] += 1
+
+    current_ts = history["timestamp"].iloc[-1]
+    current_bar = history[history["timestamp"] == current_ts]
+
+    # 1) Settle orders submitted on the previous call against this bar's open.
+    _apply_fills(current_bar)
+
+    # 2) Decide whether to rebalance on this bar.
+    new_orders = []
+    if (
+        _state["bar_count"] % REBALANCE_PERIOD == 0
+        and _state["bar_count"] >= LOOKBACK_TREND
+    ):
+        new_orders = _compute_rebalance_orders(history)
+
+    # 3) Remember these orders so we can settle them next bar.
+    _state["pending_orders"] = list(new_orders)
+
+    return new_orders
+```
+
+**Notes on the design choices**
+
+- *Infrequent rebalancing* (every 5 bars) keeps turnover, order count, and per-bar compute cost low, and only the rebalance bars do the (still bounded) pivot/rank computation over a limited recent window rather than the whole history.
+- *Trend filter + momentum ranking* is a simple, robust, well-known factor combination that avoids catching falling knives while still capturing trending names.
+- *Inverse-vol weighting with a weight cap* diversifies risk contribution and avoids concentrating too much in one low-vol/high-momentum name.
+- *Cash buffer* plus *replaying the exact fill/partial-fill logic internally* keeps the module's belief about its own cash/positions aligned with what the platform will actually do, since no fill confirmations are provided.
+- Selling before buying in the returned order list (and in the internal simulation) ensures freed-up cash from trims/exits is available to fund new buys in the same execution bar, exactly as the platform would apply it.

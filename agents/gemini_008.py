@@ -1,0 +1,188 @@
+import numpy as np
+import pandas as pd
+
+# Global state variables
+_cash = 100000.0
+_positions = {}       # Map: ticker -> share count (int)
+_pending_orders = []  # List: [(ticker, direction, size)] submitted at previous bar
+_last_prices = {}     # Map: ticker -> last known close price
+
+
+def init(cash: float) -> None:
+    """
+    Initialize trading agent state. Called exactly once before the first bar.
+    
+    Parameters:
+    cash : float
+        Starting cash balance.
+    """
+    global _cash, _positions, _pending_orders, _last_prices
+    _cash = float(cash)
+    _positions = {}
+    _pending_orders = []
+    _last_prices = {}
+
+
+def on_bar(history: pd.DataFrame) -> list[tuple[str, str, int]]:
+    """
+    Process market history up to the current timestep and return a list of orders.
+    
+    Parameters:
+    history : pd.DataFrame
+        Columns: ['timestamp', 'ticker', 'open', 'high', 'low', 'close', 'volume']
+        
+    Returns:
+    list of tuples: (ticker, direction, size) where direction is 'BUY' or 'SELL',
+    and size is a positive integer.
+    """
+    global _cash, _positions, _pending_orders, _last_prices
+
+    if history is None or history.empty:
+        return []
+
+    # Fast lookup for current bar timestamps and prices
+    timestamps = history['timestamp'].values
+    unique_ts = pd.unique(timestamps)
+    curr_ts = unique_ts[-1]
+
+    # Filter history for the current timestamp
+    curr_bar_mask = (timestamps == curr_ts)
+    curr_bar = history.iloc[curr_bar_mask]
+
+    curr_open_dict = dict(zip(curr_bar['ticker'], curr_bar['open']))
+    curr_close_dict = dict(zip(curr_bar['ticker'], curr_bar['close']))
+
+    # Store last known close prices for fallback valuation
+    for tkr, cl in curr_close_dict.items():
+        if pd.notna(cl) and cl > 0:
+            _last_prices[tkr] = float(cl)
+
+    # 1. Reconcile execution of pending orders submitted on previous bar
+    # Orders execute at the CURRENT bar's OPEN price
+    if _pending_orders:
+        for ticker, direction, requested_size in _pending_orders:
+            open_px = curr_open_dict.get(ticker)
+            if open_px is not None and pd.notna(open_px) and open_px > 0:
+                if direction == "BUY":
+                    max_affordable = int(_cash // open_px)
+                    fill_qty = min(requested_size, max_affordable)
+                    if fill_qty > 0:
+                        _cash -= fill_qty * open_px
+                        _positions[ticker] = _positions.get(ticker, 0) + fill_qty
+                elif direction == "SELL":
+                    current_held = _positions.get(ticker, 0)
+                    fill_qty = min(requested_size, current_held)
+                    if fill_qty > 0:
+                        _cash += fill_qty * open_px
+                        _positions[ticker] = current_held - fill_qty
+                        if _positions[ticker] <= 0:
+                            _positions.pop(ticker, None)
+
+        _pending_orders = []
+
+    # 2. Mark-to-market total portfolio value
+    portfolio_value = _cash
+    for ticker, qty in _positions.items():
+        px = curr_close_dict.get(ticker, _last_prices.get(ticker, 0.0))
+        portfolio_value += qty * px
+
+    # Require minimum timestamp count to establish signal baseline
+    num_ts = len(unique_ts)
+    if num_ts < 10:
+        return []
+
+    # 3. Vectorized signal calculation over recent lookback window (max 60 bars)
+    lookback = min(num_ts, 60)
+    min_ts = unique_ts[-lookback]
+
+    recent_mask = (timestamps >= min_ts)
+    recent_df = history.iloc[recent_mask]
+
+    # Pivot close prices: rows = timestamp, columns = ticker
+    pivot_close = recent_df.pivot(index='timestamp', columns='ticker', values='close')
+    pivot_close = pivot_close.ffill().bfill()
+
+    if pivot_close.empty or len(pivot_close) < 5:
+        return []
+
+    curr_len = len(pivot_close)
+    fast_p = min(10, curr_len - 1)
+    slow_p = min(30, curr_len - 1)
+    ret_p = min(15, curr_len - 1)
+    vol_p = min(20, curr_len - 1)
+
+    # Calculate Moving Averages, Momentum (ROC), and Volatility
+    sma_fast = pivot_close.tail(fast_p).mean(axis=0)
+    sma_slow = pivot_close.tail(slow_p).mean(axis=0)
+
+    close_curr = pivot_close.iloc[-1]
+    close_prev = pivot_close.iloc[-ret_p - 1] if curr_len > ret_p else pivot_close.iloc[0]
+    returns_mom = (close_curr / close_prev) - 1.0
+
+    log_rets = np.log(pivot_close / pivot_close.shift(1))
+    volatility = log_rets.tail(vol_p).std(axis=0)
+
+    # Filter active tickers present in current bar with valid prices
+    active_tickers = [
+        t for t in curr_bar['ticker'] 
+        if pd.notna(curr_close_dict.get(t)) and curr_close_dict.get(t) > 0
+    ]
+
+    ticker_scores = {}
+    ticker_vols = {}
+
+    for t in active_tickers:
+        if t in pivot_close.columns:
+            sf = sma_fast.get(t, np.nan)
+            ss = sma_slow.get(t, np.nan)
+            ret = returns_mom.get(t, np.nan)
+            vol = volatility.get(t, np.nan)
+            p = curr_close_dict[t]
+
+            # Signal rules: Upside trend, positive momentum, positive volatility
+            if pd.notna(sf) and pd.notna(ss) and pd.notna(ret) and pd.notna(vol):
+                if p > ss and sf > ss and ret > 0 and vol > 1e-6:
+                    trend_score = (sf / ss) - 1.0
+                    composite_score = 0.5 * trend_score + 0.5 * ret
+                    ticker_scores[t] = composite_score
+                    ticker_vols[t] = vol
+
+    # 4. Target Portfolio Selection & Inverse-Volatility Sizing
+    max_positions = 10
+    sorted_tickers = sorted(ticker_scores.keys(), key=lambda x: ticker_scores[x], reverse=True)
+    selected_tickers = sorted_tickers[:max_positions]
+
+    target_shares = {}
+
+    if selected_tickers:
+        inv_vols = np.array([1.0 / ticker_vols[t] for t in selected_tickers])
+        inv_vol_sum = np.sum(inv_vols)
+
+        if inv_vol_sum > 0:
+            # 95% total target allocation leaves a 5% cash buffer against slippage/gap risks
+            target_weights = 0.95 * (inv_vols / inv_vol_sum)
+            for t, w in zip(selected_tickers, target_weights):
+                target_val = portfolio_value * w
+                p = curr_close_dict[t]
+                target_shares[t] = int(target_val // p)
+
+    # 5. Order Generation (SELLs prioritized first to unlock capital)
+    all_tickers = set(_positions.keys()).union(set(target_shares.keys()))
+    sell_orders = []
+    buy_orders = []
+
+    for t in all_tickers:
+        curr_qty = _positions.get(t, 0)
+        targ_qty = target_shares.get(t, 0)
+        diff = targ_qty - curr_qty
+
+        if diff < 0:
+            sell_orders.append((t, "SELL", int(abs(diff))))
+        elif diff > 0:
+            buy_orders.append((t, "BUY", int(diff)))
+
+    # Return SELL orders first, followed by BUY orders
+    orders = sell_orders + buy_orders
+    _pending_orders = list(orders)
+
+    return orders

@@ -1,0 +1,395 @@
+import math
+from collections import defaultdict, deque
+
+import numpy as np
+import pandas as pd
+
+
+# Account state maintained locally because the platform does not provide fills.
+_cash = 0.0
+_positions = {}
+_pending_orders = []
+_seen_rows = 0
+_bar_number = 0
+
+# Market-data state.
+_closes = defaultdict(lambda: deque(maxlen=130))
+_volumes = defaultdict(lambda: deque(maxlen=40))
+_last_close = {}
+
+# Strategy parameters.
+LOOKBACK_MOMENTUM = 60
+LOOKBACK_FAST = 20
+LOOKBACK_TREND = 50
+LOOKBACK_VOL = 20
+
+REBALANCE_EVERY = 5
+MAX_HOLDINGS = 6
+TOTAL_RISK_BUDGET = 0.84
+MAX_SINGLE_WEIGHT = 0.20
+
+
+def init(cash):
+    """
+    Called once by the platform before the first bar.
+    """
+    global _cash, _positions, _pending_orders, _seen_rows, _bar_number
+    global _closes, _volumes, _last_close
+
+    _cash = float(cash)
+    _positions = {}
+    _pending_orders = []
+    _seen_rows = 0
+    _bar_number = 0
+
+    _closes = defaultdict(lambda: deque(maxlen=130))
+    _volumes = defaultdict(lambda: deque(maxlen=40))
+    _last_close = {}
+
+
+def _valid_price(value):
+    try:
+        return math.isfinite(float(value)) and float(value) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _execute_pending_orders(current_bars):
+    """
+    Reconstruct fills for orders sent on the previous bar.
+
+    The platform executes at the current open. Orders are processed in their
+    returned order, so sells are deliberately generated before buys.
+    """
+    global _cash, _positions, _pending_orders
+
+    if not _pending_orders:
+        return
+
+    opens = {}
+    for row in current_bars.itertuples(index=False):
+        ticker = row.ticker
+        price = row.open
+        if _valid_price(price):
+            opens[ticker] = float(price)
+
+    for ticker, direction, requested_size in _pending_orders:
+        price = opens.get(ticker)
+        if price is None:
+            continue
+
+        requested_size = int(requested_size)
+        if requested_size <= 0:
+            continue
+
+        if direction == "SELL":
+            held = int(_positions.get(ticker, 0))
+            filled = min(held, requested_size)
+            if filled > 0:
+                _cash += filled * price
+                remaining = held - filled
+                if remaining > 0:
+                    _positions[ticker] = remaining
+                else:
+                    _positions.pop(ticker, None)
+
+        elif direction == "BUY":
+            affordable = int(_cash // price)
+            filled = min(requested_size, affordable)
+            if filled > 0:
+                _cash -= filled * price
+                _positions[ticker] = int(_positions.get(ticker, 0)) + filled
+
+    _pending_orders = []
+
+
+def _portfolio_value():
+    """
+    Mark positions using the most recently seen close. This allows holdings in
+    temporarily absent tickers to remain represented in portfolio value.
+    """
+    value = _cash
+    for ticker, shares in _positions.items():
+        price = _last_close.get(ticker)
+        if shares > 0 and _valid_price(price):
+            value += shares * float(price)
+    return value
+
+
+def _capped_weights(raw_weights, total_weight, max_weight):
+    """
+    Normalize positive raw weights, while imposing a per-position ceiling.
+    Any undistributable capital remains as cash.
+    """
+    names = [name for name, value in raw_weights.items() if value > 0.0]
+    if not names:
+        return {}
+
+    result = {name: 0.0 for name in names}
+    remaining = min(float(total_weight), len(names) * float(max_weight))
+    active = set(names)
+
+    while active and remaining > 1e-10:
+        denom = sum(raw_weights[name] for name in active)
+        if denom <= 0:
+            break
+
+        capped_any = False
+        for name in list(active):
+            proposed = remaining * raw_weights[name] / denom
+            room = max_weight - result[name]
+            if proposed >= room - 1e-12:
+                result[name] += max(0.0, room)
+                remaining -= max(0.0, room)
+                active.remove(name)
+                capped_any = True
+
+        if not capped_any:
+            denom = sum(raw_weights[name] for name in active)
+            for name in active:
+                allocation = remaining * raw_weights[name] / denom
+                result[name] += allocation
+            remaining = 0.0
+
+    return result
+
+
+def _build_targets(active_prices):
+    """
+    Cross-sectional long-only momentum/trend model.
+
+    A ticker is eligible when:
+      * enough history exists,
+      * it is above its 50-bar average,
+      * both medium-term and short-term momentum are positive.
+
+    Ranking emphasizes risk-adjusted 60-bar momentum. Position weights are
+    inverse-volatility weighted, capped at 20% per ticker.
+    """
+    candidates = []
+
+    for ticker, price in active_prices.items():
+        closes = _closes[ticker]
+        volumes = _volumes[ticker]
+
+        if len(closes) < LOOKBACK_MOMENTUM + 1:
+            continue
+
+        values = np.asarray(closes, dtype=float)
+        if not np.all(np.isfinite(values)):
+            continue
+
+        current = values[-1]
+        if current <= 0.0:
+            continue
+
+        ma50 = float(np.mean(values[-LOOKBACK_TREND:]))
+        mom60 = current / values[-(LOOKBACK_MOMENTUM + 1)] - 1.0
+        mom20 = current / values[-(LOOKBACK_FAST + 1)] - 1.0
+
+        log_returns = np.diff(np.log(values[-(LOOKBACK_VOL + 1):]))
+        volatility = float(np.std(log_returns, ddof=1))
+
+        if (
+            not math.isfinite(volatility)
+            or volatility <= 0.0005
+            or current < ma50
+            or mom60 <= 0.0
+            or mom20 <= -0.02
+        ):
+            continue
+
+        # Risk-adjusted momentum, with a modest reward for recent confirmation.
+        score = (0.75 * mom60 + 0.25 * mom20) / volatility
+        if not math.isfinite(score) or score <= 0.0:
+            continue
+
+        # Prefer liquid names when volume data exists, without imposing a
+        # hard absolute volume threshold that may not suit all datasets.
+        liquidity_bonus = 0.0
+        if len(volumes) >= 10:
+            median_volume = float(np.median(np.asarray(volumes, dtype=float)[-10:]))
+            if math.isfinite(median_volume) and median_volume > 0:
+                liquidity_bonus = min(0.15, math.log1p(median_volume) / 100.0)
+
+        candidates.append((score + liquidity_bonus, ticker, volatility))
+
+    candidates.sort(reverse=True)
+    selected = candidates[:MAX_HOLDINGS]
+
+    if not selected:
+        return {}
+
+    # Better score and lower volatility both increase the target allocation.
+    raw = {}
+    for score, ticker, volatility in selected:
+        raw[ticker] = max(0.001, score) / max(volatility, 0.005)
+
+    return _capped_weights(raw, TOTAL_RISK_BUDGET, MAX_SINGLE_WEIGHT)
+
+
+def _hard_stop_orders(active_prices):
+    """
+    Daily emergency exits between scheduled rebalances.
+
+    Exit if price is materially below both its 50-bar average and its recent
+    high. This reduces exposure to severe reversals without frequent normal
+    turnover.
+    """
+    orders = []
+
+    for ticker, shares in list(_positions.items()):
+        if shares <= 0 or ticker not in active_prices:
+            continue
+
+        closes = _closes[ticker]
+        if len(closes) < LOOKBACK_TREND:
+            continue
+
+        values = np.asarray(closes, dtype=float)
+        current = values[-1]
+        ma50 = float(np.mean(values[-LOOKBACK_TREND:]))
+        recent_high = float(np.max(values[-60:]))
+
+        if current < 0.97 * ma50 and current < 0.88 * recent_high:
+            orders.append((ticker, "SELL", int(shares)))
+
+    return orders
+
+
+def _rebalance_orders(active_prices):
+    """
+    Convert target portfolio weights into sell-first then buy orders.
+    """
+    targets = _build_targets(active_prices)
+    equity = _portfolio_value()
+
+    if equity <= 0.0:
+        return []
+
+    desired_shares = {}
+    for ticker, weight in targets.items():
+        price = active_prices.get(ticker)
+        if _valid_price(price):
+            desired_shares[ticker] = int((equity * weight) // float(price))
+
+    sells = []
+    buys = []
+
+    # Sell positions that have left the target set or are oversized.
+    for ticker, held in list(_positions.items()):
+        if held <= 0 or ticker not in active_prices:
+            continue
+
+        target = desired_shares.get(ticker, 0)
+        delta = target - int(held)
+
+        if delta < 0:
+            # Ignore tiny rebalance noise, but always fully exit removed names.
+            if target == 0 or abs(delta) >= max(2, int(0.05 * max(target, 1))):
+                sells.append((ticker, "SELL", int(-delta)))
+
+    # Estimate available funds after expected sales. A small haircut protects
+    # against next-open gaps because actual fills occur next bar.
+    expected_sale_proceeds = 0.0
+    for ticker, _, size in sells:
+        price = active_prices.get(ticker)
+        if _valid_price(price):
+            expected_sale_proceeds += float(price) * int(size)
+
+    estimated_buying_power = _cash + 0.98 * expected_sale_proceeds
+
+    proposed_buys = []
+    for ticker, target in desired_shares.items():
+        held = int(_positions.get(ticker, 0))
+        delta = target - held
+        if delta <= 0:
+            continue
+
+        if delta < max(2, int(0.05 * max(target, 1))):
+            continue
+
+        price = active_prices.get(ticker)
+        if _valid_price(price):
+            proposed_buys.append((ticker, delta, float(price)))
+
+    proposed_cost = sum(size * price for _, size, price in proposed_buys)
+
+    # Scale buys proportionally if close-price estimates exceed available cash.
+    scale = 1.0
+    if proposed_cost > estimated_buying_power and proposed_cost > 0.0:
+        scale = max(0.0, estimated_buying_power / proposed_cost)
+
+    # Highest target weight first. This also defines deterministic fill order.
+    proposed_buys.sort(
+        key=lambda item: targets.get(item[0], 0.0),
+        reverse=True,
+    )
+
+    for ticker, size, _ in proposed_buys:
+        scaled_size = int(size * scale)
+        if scaled_size > 0:
+            buys.append((ticker, "BUY", scaled_size))
+
+    return sells + buys
+
+
+def on_bar(history):
+    """
+    Called once per timestamp. Orders returned here are executed at the next
+    timestamp's open.
+    """
+    global _seen_rows, _bar_number, _pending_orders
+
+    if history is None or len(history) == 0:
+        return []
+
+    # In normal platform operation only the current timestamp has been added
+    # since the preceding call.
+    if _seen_rows >= len(history):
+        return []
+
+    new_rows = history.iloc[_seen_rows:]
+    _seen_rows = len(history)
+
+    current_timestamp = new_rows["timestamp"].iloc[-1]
+    current_bars = new_rows[new_rows["timestamp"] == current_timestamp]
+
+    # First reconcile prior orders at the execution open.
+    _execute_pending_orders(current_bars)
+
+    active_prices = {}
+
+    # Then incorporate the completed current bar into signal history.
+    for row in current_bars.itertuples(index=False):
+        ticker = row.ticker
+        close = row.close
+
+        if _valid_price(close):
+            close = float(close)
+            _closes[ticker].append(close)
+            _last_close[ticker] = close
+            active_prices[ticker] = close
+
+        volume = row.volume
+        try:
+            volume = float(volume)
+            if math.isfinite(volume) and volume >= 0.0:
+                _volumes[ticker].append(volume)
+        except (TypeError, ValueError):
+            pass
+
+    _bar_number += 1
+
+    if not active_prices:
+        return []
+
+    # Use scheduled portfolio construction, with daily hard-stop protection.
+    if _bar_number % REBALANCE_EVERY == 0:
+        orders = _rebalance_orders(active_prices)
+    else:
+        orders = _hard_stop_orders(active_prices)
+
+    # Save returned orders so fills can be reconstructed next call.
+    _pending_orders = orders
+    return orders

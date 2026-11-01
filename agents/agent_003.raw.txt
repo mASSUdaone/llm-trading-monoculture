@@ -1,0 +1,198 @@
+# Trading Agent Design
+
+**Core idea:** cross-sectional momentum with volatility-weighted sizing, periodic rebalancing, and a trailing-stop overlay for risk control — all long-only (no shorting, as required).
+
+## Key design points
+
+**State tracking without fill feedback.** The platform gives no fill reports, but fills are deterministic ("largest possible quantity fills") and happen at the *next* bar's open — a price I *do* see once that bar arrives in `history`. So I queue orders as `pending_orders`, and on the following call, before doing anything else, I replay the exact same fill logic the platform uses (floor(cash/price) for buys, min(held, size) for sells, zero if price missing) using that bar's open. This keeps my internal cash/position ledger exactly in sync with reality, with no drift.
+
+**Efficient incremental reads.** `history` is append-only, so instead of re-scanning the whole DataFrame every bar (O(n²) over a run), I track how many rows I've already consumed and only look at the newly appended slice (`history.iloc[last_len:]`) — that's this bar's rows across tickers.
+
+**Signal.** For each ticker I keep a rolling window of closes. Every `REBALANCE_EVERY` bars I compute a 12-1-style momentum score (return from ~147 bars ago to ~21 bars ago, skipping the most recent month to avoid short-term reversal effects), keep only tickers with *positive* momentum (trend filter, since we can't short), rank them, and take the top N.
+
+**Sizing.** Selected names are weighted inversely to recent realized volatility (risk parity-ish), normalized to target ~95% invested, with a per-name cap so no single position dominates. Target dollar allocations are converted to target share counts; orders are the deltas versus current holdings.
+
+**Risk overlay.** Independent of the rebalance schedule, every bar I check each held position against its peak close since acquisition; a drawdown beyond a threshold triggers an immediate full-position sell, bypassing the schedule.
+
+**Safety.** All order sizes are derived from my own tracked cash/positions, and the platform caps fills at what's actually affordable/held anyway, so there's no risk of invalid orders.
+
+```python
+import numpy as np
+import pandas as pd
+from collections import deque
+
+# ---------------- strategy parameters ----------------
+LOOKBACK_MOM      = 63     # bars for momentum measurement window
+MOM_SKIP          = 5      # bars to skip at the end (avoid short-term reversal)
+LOOKBACK_VOL      = 21     # bars for volatility estimate
+MAX_HIST          = 260    # max closes kept per ticker
+N_TOP             = 8      # max number of concurrent positions
+REBALANCE_EVERY   = 10     # bars between rebalances
+MAX_WEIGHT        = 0.20   # max weight per position
+TARGET_INVEST     = 0.95   # target fraction of equity invested
+TRAILING_STOP_PCT = 0.15   # sell if price falls this much from peak since held
+WARMUP            = LOOKBACK_MOM + MOM_SKIP + 2
+
+_state = {}
+
+
+def init(cash):
+    _state.clear()
+    _state['cash'] = float(cash)
+    _state['positions'] = {}        # ticker -> int shares
+    _state['pending_orders'] = []   # orders submitted last bar, to fill at this bar's open
+    _state['closes'] = {}           # ticker -> deque of recent closes
+    _state['peak'] = {}             # ticker -> peak close since position opened
+    _state['last_len'] = 0          # rows of history already consumed
+    _state['bar_count'] = 0
+
+
+def _execute_pending(open_prices):
+    """Replicate the platform's fill logic exactly, using this bar's open prices,
+    to keep our internal cash/position ledger consistent with reality."""
+    cash = _state['cash']
+    positions = _state['positions']
+    for ticker, direction, size in _state['pending_orders']:
+        price = open_prices.get(ticker)
+        if price is None or pd.isna(price) or price <= 0 or size <= 0:
+            continue
+        if direction == 'BUY':
+            affordable = int(cash // price)
+            qty = min(size, affordable)
+            if qty > 0:
+                cash -= qty * price
+                positions[ticker] = positions.get(ticker, 0) + qty
+        elif direction == 'SELL':
+            held = positions.get(ticker, 0)
+            qty = min(size, held)
+            if qty > 0:
+                cash += qty * price
+                remaining = held - qty
+                if remaining > 0:
+                    positions[ticker] = remaining
+                else:
+                    positions.pop(ticker, None)
+    _state['cash'] = cash
+    _state['pending_orders'] = []
+
+
+def on_bar(history):
+    st = _state
+    n = len(history)
+    new_rows = history.iloc[st['last_len']:n]
+    st['last_len'] = n
+    if new_rows.empty:
+        return []
+
+    open_prices = dict(zip(new_rows['ticker'], new_rows['open']))
+    close_prices_raw = dict(zip(new_rows['ticker'], new_rows['close']))
+    close_prices = {t: p for t, p in close_prices_raw.items() if p is not None and not pd.isna(p) and p > 0}
+
+    # 1. settle orders queued from the previous bar, using this bar's open prices
+    _execute_pending(open_prices)
+
+    # 2. update rolling close-price history
+    closes = st['closes']
+    for t, c in close_prices.items():
+        dq = closes.get(t)
+        if dq is None:
+            dq = deque(maxlen=MAX_HIST)
+            closes[t] = dq
+        dq.append(c)
+
+    st['bar_count'] += 1
+    positions = st['positions']
+    orders = []
+    stopped_out = set()
+
+    # 3. trailing-stop risk overlay (every bar, independent of rebalance schedule)
+    peak = st['peak']
+    for t in list(positions.keys()):
+        price = close_prices.get(t)
+        if price is None:
+            continue
+        pk = max(peak.get(t, price), price)
+        peak[t] = pk
+        if price <= pk * (1 - TRAILING_STOP_PCT):
+            held = positions.get(t, 0)
+            if held > 0:
+                orders.append((t, 'SELL', held))
+                stopped_out.add(t)
+                peak.pop(t, None)
+
+    # 4. periodic momentum rebalance
+    if st['bar_count'] >= WARMUP and st['bar_count'] % REBALANCE_EVERY == 0:
+        scores, vols = {}, {}
+        need = LOOKBACK_MOM + MOM_SKIP
+        for t, dq in closes.items():
+            if t in stopped_out or len(dq) < need:
+                continue
+            price_now = dq[-MOM_SKIP] if MOM_SKIP > 0 else dq[-1]
+            price_ref = dq[-need]
+            if price_ref <= 0:
+                continue
+            mom = price_now / price_ref - 1.0
+            if mom <= 0:
+                continue
+            arr = np.asarray(dq)[-(LOOKBACK_VOL + 1):]
+            if len(arr) >= 2:
+                rets = np.diff(arr) / arr[:-1]
+                vol = float(np.std(rets))
+            else:
+                vol = np.nan
+            if not np.isfinite(vol) or vol <= 1e-6:
+                vol = 1e-2
+            scores[t] = mom
+            vols[t] = vol
+
+        selected = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:N_TOP]
+        sel_tickers = [t for t, _ in selected]
+
+        # portfolio equity valuation (cash + mark-to-market positions)
+        equity = st['cash']
+        for t, sh in positions.items():
+            p = close_prices.get(t)
+            if p is None:
+                dq = closes.get(t)
+                p = dq[-1] if dq else 0.0
+            equity += sh * p
+
+        weights = {}
+        if sel_tickers:
+            inv_vol = {t: 1.0 / vols[t] for t in sel_tickers}
+            tot = sum(inv_vol.values())
+            for t in sel_tickers:
+                w = (inv_vol[t] / tot) * TARGET_INVEST
+                weights[t] = min(w, MAX_WEIGHT)
+
+        target_shares = {}
+        for t, w in weights.items():
+            price = close_prices.get(t)
+            if price is None or price <= 0:
+                continue
+            target_shares[t] = int((w * equity) // price)
+
+        all_relevant = set(positions.keys()) | set(target_shares.keys())
+        for t in all_relevant:
+            if t in stopped_out:
+                continue
+            cur = positions.get(t, 0)
+            tgt = target_shares.get(t, 0)
+            price = close_prices.get(t)
+            if price is None or price <= 0:
+                continue
+            if tgt > cur:
+                orders.append((t, 'BUY', tgt - cur))
+            elif tgt < cur:
+                orders.append((t, 'SELL', cur - tgt))
+
+    st['pending_orders'] = orders
+    return orders
+```
+
+### Why this should behave reasonably
+- **No lookahead / no invalid orders**: sizing is based only on data available up to the current bar; fills are always capped by the platform, and my own ledger tracks that exactly, so I never *intend* to overspend or oversell.
+- **Diversification & risk caps**: at most `N_TOP` names, inverse-vol weighted, per-name cap, ~5% cash buffer.
+- **Trend filter**: only invests in assets with positive intermediate-term momentum; falls back to cash otherwise.
+- **Downside protection**: trailing stop can exit a position on any bar, not just rebalance days.
+- **Efficient**: O(new rows) per bar plus O(#tickers) only every 10 bars — comfortably within the time budget even for large universes/long histories.

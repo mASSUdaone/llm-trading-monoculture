@@ -1,0 +1,476 @@
+Below is a self-contained module implementing a conservative cross-sectional momentum strategy with volatility-based sizing, weekly rebalancing, liquidity filtering, stop-loss exits, and internal accounting that reconstructs fills from the next bar’s open prices.
+
+```python
+from collections import defaultdict, deque
+import math
+import numpy as np
+
+
+# Strategy parameters
+_LOOKBACK_LONG = 126          # Roughly six months of trading observations
+_LOOKBACK_SHORT = 63          # Roughly three months
+_VOL_LOOKBACK = 21            # One month realized volatility
+_HISTORY_LENGTH = 260
+
+_REBALANCE_EVERY = 5          # Rebalance weekly
+_MAX_HOLDINGS = 6
+_TARGET_EXPOSURE = 0.90       # Keep 10% cash buffer
+_MAX_POSITION_WEIGHT = 0.30
+
+_STOP_LOSS = 0.12             # Exit after 12% drawdown from post-entry high
+_COOLDOWN_BARS = 10           # Avoid immediately repurchasing stopped names
+
+_MIN_PRICE = 2.0
+_MIN_TRADE_DOLLARS = 0.002    # Ignore rebalancing changes below 0.2% of NAV
+
+
+# Module state, initialized by init()
+_cash = 0.0
+_positions = {}
+_pending_orders = []
+_seen_rows = 0
+_bar_number = 0
+
+_closes = {}
+_dollar_volumes = {}
+_last_close = {}
+_high_water = {}
+_cooldown = {}
+
+
+def init(cash):
+    """
+    Called once by the platform before the first bar.
+    """
+    global _cash, _positions, _pending_orders, _seen_rows, _bar_number
+    global _closes, _dollar_volumes, _last_close, _high_water, _cooldown
+
+    _cash = float(cash)
+    _positions = defaultdict(int)
+    _pending_orders = []
+    _seen_rows = 0
+    _bar_number = 0
+
+    _closes = defaultdict(lambda: deque(maxlen=_HISTORY_LENGTH))
+    _dollar_volumes = defaultdict(lambda: deque(maxlen=_HISTORY_LENGTH))
+    _last_close = {}
+    _high_water = {}
+    _cooldown = {}
+
+
+def _valid_price(value):
+    try:
+        return math.isfinite(float(value)) and float(value) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _apply_pending_orders(current_rows):
+    """
+    Reconstruct fills for orders sent on the preceding callback.
+
+    Orders execute at this bar's open. The platform does not provide fill
+    reports, so this function mirrors the stated fill rules internally.
+    """
+    global _cash, _pending_orders
+
+    if not _pending_orders:
+        return
+
+    open_prices = {}
+
+    for row in current_rows.itertuples(index=False):
+        ticker = row.ticker
+        price = row.open
+        if _valid_price(price):
+            open_prices[ticker] = float(price)
+
+    for ticker, direction, requested_size in _pending_orders:
+        price = open_prices.get(ticker)
+
+        # No valid execution price means no fill.
+        if price is None:
+            continue
+
+        requested_size = int(requested_size)
+        if requested_size <= 0:
+            continue
+
+        if direction == "SELL":
+            available = int(_positions.get(ticker, 0))
+            filled = min(requested_size, available)
+
+            if filled > 0:
+                _positions[ticker] -= filled
+                _cash += filled * price
+
+                if _positions[ticker] <= 0:
+                    _positions.pop(ticker, None)
+                    _high_water.pop(ticker, None)
+
+        elif direction == "BUY":
+            affordable = int(_cash // price)
+            filled = min(requested_size, affordable)
+
+            if filled > 0:
+                _positions[ticker] += filled
+                _cash -= filled * price
+
+                old_high = _high_water.get(ticker)
+                if old_high is None:
+                    _high_water[ticker] = price
+                else:
+                    _high_water[ticker] = max(old_high, price)
+
+    _pending_orders = []
+
+
+def _update_market_data(current_rows):
+    """
+    Add the current timestamp's close and dollar-volume data to rolling state.
+    """
+    current_prices = {}
+
+    for row in current_rows.itertuples(index=False):
+        ticker = row.ticker
+        close = row.close
+        volume = row.volume
+
+        if not _valid_price(close):
+            continue
+
+        close = float(close)
+        current_prices[ticker] = close
+
+        _closes[ticker].append(close)
+        _last_close[ticker] = close
+
+        try:
+            volume = float(volume)
+            if not math.isfinite(volume) or volume < 0:
+                volume = 0.0
+        except (TypeError, ValueError):
+            volume = 0.0
+
+        _dollar_volumes[ticker].append(close * volume)
+
+    # Track highest observed close since entry for trailing stop purposes.
+    for ticker, shares in list(_positions.items()):
+        if shares <= 0:
+            continue
+
+        if ticker in current_prices:
+            close = current_prices[ticker]
+            prior_high = _high_water.get(ticker, close)
+            _high_water[ticker] = max(prior_high, close)
+
+    return current_prices
+
+
+def _portfolio_value():
+    """
+    Mark the internally tracked portfolio to the most recent observed close.
+    """
+    value = _cash
+
+    for ticker, shares in _positions.items():
+        if shares <= 0:
+            continue
+
+        price = _last_close.get(ticker)
+        if price is not None and _valid_price(price):
+            value += shares * price
+
+    return max(value, 0.0)
+
+
+def _candidate_universe(current_prices, excluded):
+    """
+    Build a liquid, positive-momentum candidate set.
+
+    Score:
+        70% six-month momentum
+        30% three-month momentum
+
+    Position weights are set separately using inverse recent volatility.
+    """
+    candidates = []
+
+    for ticker, current_price in current_prices.items():
+        if ticker in excluded:
+            continue
+
+        if _cooldown.get(ticker, 0) > 0:
+            continue
+
+        if current_price < _MIN_PRICE:
+            continue
+
+        prices = _closes.get(ticker)
+        volumes = _dollar_volumes.get(ticker)
+
+        if prices is None or volumes is None:
+            continue
+
+        if len(prices) < (_LOOKBACK_LONG + 1):
+            continue
+
+        p = np.asarray(prices, dtype=float)
+
+        if not np.all(np.isfinite(p)) or np.any(p <= 0):
+            continue
+
+        long_return = (p[-1] / p[-(_LOOKBACK_LONG + 1)]) - 1.0
+        short_return = (p[-1] / p[-(_LOOKBACK_SHORT + 1)]) - 1.0
+
+        recent_prices = p[-(_VOL_LOOKBACK + 1):]
+        log_returns = np.diff(np.log(recent_prices))
+
+        if len(log_returns) < 10:
+            continue
+
+        volatility = float(np.std(log_returns, ddof=1))
+        if not math.isfinite(volatility) or volatility <= 0:
+            continue
+
+        recent_dollar_volume = float(np.mean(volumes[-_VOL_LOOKBACK:]))
+        if not math.isfinite(recent_dollar_volume) or recent_dollar_volume <= 0:
+            continue
+
+        # Avoid buying names with negative medium-term trend.
+        if long_return <= 0.0 or short_return < -0.02:
+            continue
+
+        momentum_score = 0.70 * long_return + 0.30 * short_return
+
+        candidates.append(
+            {
+                "ticker": ticker,
+                "price": current_price,
+                "score": momentum_score,
+                "volatility": volatility,
+                "dollar_volume": recent_dollar_volume,
+            }
+        )
+
+    if not candidates:
+        return []
+
+    # Remove the least liquid quarter of otherwise valid candidates.
+    liquidities = np.array([x["dollar_volume"] for x in candidates], dtype=float)
+    liquidity_cutoff = float(np.percentile(liquidities, 25))
+
+    liquid_candidates = [
+        x for x in candidates
+        if x["dollar_volume"] >= liquidity_cutoff
+    ]
+
+    liquid_candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    return liquid_candidates[:_MAX_HOLDINGS]
+
+
+def _capped_inverse_volatility_weights(candidates):
+    """
+    Allocate exposure inversely to realized volatility while enforcing a
+    maximum single-name allocation.
+    """
+    if not candidates:
+        return {}
+
+    inverse_vol = np.array(
+        [1.0 / max(item["volatility"], 1e-8) for item in candidates],
+        dtype=float,
+    )
+
+    weights = inverse_vol / inverse_vol.sum()
+    weights *= _TARGET_EXPOSURE
+
+    # Iteratively redistribute any weight above the position cap.
+    for _ in range(10):
+        capped = weights > _MAX_POSITION_WEIGHT
+
+        if not np.any(capped):
+            break
+
+        excess = float(np.sum(weights[capped] - _MAX_POSITION_WEIGHT))
+        weights[capped] = _MAX_POSITION_WEIGHT
+
+        uncapped = ~capped
+        if not np.any(uncapped) or excess <= 0:
+            break
+
+        base = weights[uncapped]
+        base_sum = float(base.sum())
+
+        if base_sum <= 0:
+            weights[uncapped] += excess / np.sum(uncapped)
+        else:
+            weights[uncapped] += excess * (base / base_sum)
+
+    weights = np.minimum(weights, _MAX_POSITION_WEIGHT)
+
+    return {
+        item["ticker"]: float(weight)
+        for item, weight in zip(candidates, weights)
+    }
+
+
+def _stop_loss_exclusions(current_prices):
+    """
+    Identify held positions that have fallen materially from their high-water
+    mark. These names are excluded from selection and sold at the next open.
+    """
+    stopped = set()
+
+    for ticker, shares in list(_positions.items()):
+        if shares <= 0:
+            continue
+
+        close = current_prices.get(ticker)
+        high = _high_water.get(ticker)
+
+        if close is None or high is None or high <= 0:
+            continue
+
+        if close <= high * (1.0 - _STOP_LOSS):
+            stopped.add(ticker)
+            _cooldown[ticker] = _COOLDOWN_BARS
+
+    return stopped
+
+
+def _rebalance_orders(current_prices, forced_exits):
+    """
+    Compute target portfolio holdings and return sell-first orders.
+
+    Selling first lets sale proceeds become available to subsequent buy orders
+    at the same next-bar open, assuming the platform processes returned orders
+    in list order.
+    """
+    nav = _portfolio_value()
+
+    if nav <= 0:
+        return []
+
+    candidates = _candidate_universe(current_prices, forced_exits)
+    weights = _capped_inverse_volatility_weights(candidates)
+
+    target_shares = {}
+
+    for item in candidates:
+        ticker = item["ticker"]
+        price = item["price"]
+        weight = weights.get(ticker, 0.0)
+
+        target_value = nav * weight
+        shares = int(target_value // price)
+
+        if shares > 0:
+            target_shares[ticker] = shares
+
+    sell_orders = []
+    buy_orders = []
+
+    all_tickers = set(_positions.keys()) | set(target_shares.keys()) | set(forced_exits)
+
+    for ticker in all_tickers:
+        held = int(_positions.get(ticker, 0))
+        desired = int(target_shares.get(ticker, 0))
+
+        if ticker in forced_exits:
+            desired = 0
+
+        delta = desired - held
+
+        if delta < 0:
+            sell_orders.append((ticker, "SELL", int(-delta)))
+
+        elif delta > 0:
+            price = current_prices.get(ticker, _last_close.get(ticker))
+
+            if not _valid_price(price):
+                continue
+
+            trade_value = delta * float(price)
+
+            # Avoid tiny churn trades unless this is a new position.
+            if held == 0 or trade_value >= nav * _MIN_TRADE_DOLLARS:
+                buy_orders.append((ticker, "BUY", int(delta)))
+
+    # Sells first so internally reconstructed execution follows expected order.
+    return sell_orders + buy_orders
+
+
+def on_bar(history):
+    """
+    Called once per timestamp.
+
+    The function:
+      1. Reconstructs fills from orders submitted on the prior timestamp.
+      2. Updates rolling market data with current closes.
+      3. Applies stop-loss exits.
+      4. Rebalances weekly into liquid positive-momentum names.
+    """
+    global _seen_rows, _bar_number, _pending_orders, _cooldown
+
+    if history is None or len(history) == 0:
+        return []
+
+    # The platform's history is append-only. Only process rows not seen before.
+    if _seen_rows >= len(history):
+        return []
+
+    current_rows = history.iloc[_seen_rows:]
+    _seen_rows = len(history)
+    _bar_number += 1
+
+    # Decrement post-stop cooldowns.
+    for ticker in list(_cooldown.keys()):
+        _cooldown[ticker] -= 1
+        if _cooldown[ticker] <= 0:
+            _cooldown.pop(ticker, None)
+
+    # Previous bar's submitted orders fill at this bar's open.
+    _apply_pending_orders(current_rows)
+
+    # Current close data is usable for decisions, but orders fill next open.
+    current_prices = _update_market_data(current_rows)
+
+    if not current_prices:
+        return []
+
+    forced_exits = _stop_loss_exclusions(current_prices)
+
+    # Rebalance on the first bar and then every five bars.
+    rebalance_now = ((_bar_number - 1) % _REBALANCE_EVERY) == 0
+
+    if rebalance_now:
+        orders = _rebalance_orders(current_prices, forced_exits)
+    else:
+        # Outside scheduled rebalance dates, only submit stop-loss exits.
+        orders = []
+
+        for ticker in forced_exits:
+            shares = int(_positions.get(ticker, 0))
+            if shares > 0:
+                orders.append((ticker, "SELL", shares))
+
+    # These will be internally reconciled at the next callback using next open.
+    _pending_orders = list(orders)
+
+    return orders
+```
+
+Strategy summary:
+
+- Holds up to six liquid stocks.
+- Selects stocks with positive six-month and three-month momentum.
+- Filters out the least liquid quarter of eligible names.
+- Sizes holdings inversely to recent volatility.
+- Caps each holding at 30% of portfolio value.
+- Targets 90% invested exposure, retaining a cash buffer.
+- Rebalances every five bars.
+- Exits positions that fall 12% from their post-entry high.
+- Avoids re-entering stopped positions for ten bars.
+- Reconstructs cash and positions internally using known next-bar open execution rules.

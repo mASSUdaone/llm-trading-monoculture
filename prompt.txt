@@ -1,0 +1,19 @@
+I want a trading agent. Design the approach yourself — how it picks what to hold, when to move, how much to commit, all of it. Write the code.
+
+Technical requirements for the platform your code runs on:
+
+Python 3.11, standard scientific stack available (pandas, numpy). No network access, no file access.
+
+The platform imports your module. Define your functions at module level and do not execute a run at import time.
+
+Define init(cash). The platform calls it exactly once, before the first bar. cash is a float: your starting cash balance, 100000.0.
+
+Define on_bar(history). The platform calls it once per time step, in chronological order. history is a pandas DataFrame of all bars up to and including the current one — columns timestamp, ticker, open, high, low, close, volume. Multiple rows share each timestamp: many tickers are present at every step. Rows are sorted by timestamp, then ticker, and history is append-only. You never receive future bars; the platform advances one step at a time. A ticker may be absent from some timestamps. Prices are already adjusted for splits and dividends.
+
+on_bar returns the orders for that step as a list of (ticker, direction, size), where direction is "BUY" or "SELL" and size is a positive integer number of shares. Return an empty list to do nothing. The platform records what you return; you do not write any files.
+
+Orders submitted on a bar execute at the next bar's open, with no commission, slippage, or market impact. Orders fill partially: if you cannot afford the full size, or hold fewer shares than you are selling, the largest possible quantity fills and the remainder is discarded — it is not carried forward. An order fills for zero shares if no price is available for that ticker on the execution bar. You receive no fill reports or account statements; nothing tells you your cash, positions, or what quantity filled.
+
+You cannot spend cash you do not have, sell shares you do not hold, short, or borrow.
+
+Your module must complete the full run within 60 minutes of wall-clock time. Modules that exceed this are terminated.

@@ -1,0 +1,197 @@
+# Design Overview
+
+Since the platform gives no fill reports, statements, or position info, the module has to be its own bookkeeper. The core idea:
+
+**1. Self-tracked ledger.** The platform's fill rule (next-bar open, partial fill if cash/shares insufficient, zero fill if no price) is fully deterministic and known in advance. So every `on_bar` call, before deciding anything new, I replay that exact rule against the orders I submitted last time, using this bar's `open` price. That keeps my internal `cash` / `positions` in sync with reality without ever being told the truth.
+
+**2. Strategy: cross-sectional momentum with periodic rebalancing.**
+- Track a rolling window of closes per ticker (deque, fixed length) — cheap, O(1) per tick, no re-scanning of full history.
+- Every `REBALANCE_PERIOD` bars, rank all tickers with a full window by trailing return. Take the top `TOP_N` with positive momentum, equal-weight them out of investable equity (holding a cash buffer back).
+- Between rebalances, only risk management acts (see below) — this limits churn/turnover.
+
+**3. Risk controls.**
+- A per-position stop-loss (checked every bar, not just rebalance bars) forces an exit if a name drops too far from its average entry price.
+- A cash buffer is never invested, so the strategy always keeps dry powder and never tries to over-commit.
+- Diversification across `TOP_N` names caps single-name exposure.
+
+**4. Order hygiene.** Only whole-share integer orders are emitted, sells are listed before buys (frees cash first, mirrors how the internal ledger simulation is done so the two stay consistent), and zero-delta/zero-price cases are skipped.
+
+**5. Performance.** `on_bar` only looks at the *new* rows appended since the previous call (`history.iloc[prev_len:]`), not the whole growing history, so cost per call is O(tickers-per-bar), and total cost is O(total rows) — safe for the 60-minute budget regardless of how long the backtest runs.
+
+```python
+import math
+from collections import deque
+
+# ----------------------------------------------------------------------
+# Module-level state (the platform imports this module once and calls
+# init() then on_bar() repeatedly; no execution happens at import time).
+# ----------------------------------------------------------------------
+_STATE = None
+
+# ----- strategy constants -----
+LOOKBACK = 20            # bars used to compute momentum
+REBALANCE_PERIOD = 5     # rebalance the portfolio every N bars
+TOP_N = 8                # number of names to hold at once
+CASH_BUFFER = 0.05       # fraction of equity always kept in cash
+STOP_LOSS = 0.12         # exit a position if it falls 12% from avg entry
+MIN_PRICE = 1.0          # ignore penny/garbage tickers
+
+
+def init(cash):
+    global _STATE
+    _STATE = {
+        "cash": float(cash),
+        "positions": {},        # ticker -> shares held (int)
+        "entry_price": {},      # ticker -> volume-weighted avg entry price
+        "pending_orders": [],   # orders submitted last call, to fill this bar's open
+        "prev_len": 0,          # how many rows of history we've already consumed
+        "price_hist": {},       # ticker -> deque of recent closes (len LOOKBACK+1)
+        "last_price": {},       # ticker -> last known close (for equity marking)
+        "bar_count": 0,
+        "last_rebalance_bar": -REBALANCE_PERIOD,  # force rebalance once warmed up
+    }
+
+
+def _simulate_fill(order, prices):
+    """Replay the platform's exact fill rule against our internal ledger."""
+    ticker, direction, size = order
+    price = prices.get(ticker)
+    if price is None or price <= 0 or size <= 0:
+        return
+    st = _STATE
+    if direction == "BUY":
+        affordable = int(st["cash"] // price)
+        fill = min(size, affordable)
+        if fill > 0:
+            st["cash"] -= fill * price
+            old_shares = st["positions"].get(ticker, 0)
+            old_entry = st["entry_price"].get(ticker, price)
+            new_shares = old_shares + fill
+            st["entry_price"][ticker] = (
+                (old_entry * old_shares + price * fill) / new_shares
+            )
+            st["positions"][ticker] = new_shares
+    elif direction == "SELL":
+        held = st["positions"].get(ticker, 0)
+        fill = min(size, held)
+        if fill > 0:
+            st["cash"] += fill * price
+            remaining = held - fill
+            st["positions"][ticker] = remaining
+            if remaining <= 0:
+                st["positions"].pop(ticker, None)
+                st["entry_price"].pop(ticker, None)
+
+
+def on_bar(history):
+    st = _STATE
+
+    # ---- 1. isolate rows new since the last call (cheap, O(new rows)) ----
+    new_rows = history.iloc[st["prev_len"]:]
+    st["prev_len"] = len(history)
+    if new_rows.empty:
+        return []
+
+    current_open = dict(zip(new_rows["ticker"], new_rows["open"]))
+    current_close = dict(zip(new_rows["ticker"], new_rows["close"]))
+    current_vol = dict(zip(new_rows["ticker"], new_rows["volume"]))
+
+    # ---- 2. settle orders we submitted last bar, using THIS bar's open ----
+    for order in st["pending_orders"]:
+        _simulate_fill(order, current_open)
+    st["pending_orders"] = []
+
+    # ---- 3. update rolling price history / last known prices ----
+    for ticker, close in current_close.items():
+        if close is None or close != close:  # NaN guard
+            continue
+        st["last_price"][ticker] = close
+        dq = st["price_hist"].get(ticker)
+        if dq is None:
+            dq = deque(maxlen=LOOKBACK + 1)
+            st["price_hist"][ticker] = dq
+        dq.append(close)
+
+    st["bar_count"] += 1
+    orders = []
+
+    # ---- 4. stop-loss check on every bar (risk control) ----
+    to_force_sell = set()
+    for ticker, shares in list(st["positions"].items()):
+        if shares <= 0:
+            continue
+        price = current_close.get(ticker, st["last_price"].get(ticker))
+        entry = st["entry_price"].get(ticker)
+        if price is None or entry is None or entry <= 0:
+            continue
+        if price <= entry * (1.0 - STOP_LOSS):
+            to_force_sell.add(ticker)
+            orders.append((ticker, "SELL", int(shares)))
+
+    # ---- 5. periodic rebalance based on cross-sectional momentum ----
+    do_rebalance = (st["bar_count"] - st["last_rebalance_bar"]) >= REBALANCE_PERIOD
+    if do_rebalance:
+        candidates = []
+        for ticker, dq in st["price_hist"].items():
+            if ticker in to_force_sell:
+                continue
+            if len(dq) < LOOKBACK + 1:
+                continue
+            first, last = dq[0], dq[-1]
+            if first is None or first <= 0 or last is None or last < MIN_PRICE:
+                continue
+            avg_vol = current_vol.get(ticker, None)
+            mom = (last / first) - 1.0
+            if mom > 0:
+                candidates.append((mom, ticker, last))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        selected = candidates[:TOP_N]
+        selected_tickers = {t for _, t, _ in selected}
+
+        # mark-to-market equity using best-known prices
+        equity = st["cash"]
+        for ticker, shares in st["positions"].items():
+            price = current_close.get(ticker, st["last_price"].get(ticker, 0.0))
+            equity += shares * price
+
+        investable = equity * (1.0 - CASH_BUFFER)
+        weight = investable / len(selected) if selected else 0.0
+
+        target_shares = {}
+        for mom, ticker, price in selected:
+            if price and price > 0:
+                target_shares[ticker] = int(math.floor(weight / price))
+
+        # any currently held ticker not selected (and not already force-sold)
+        # should be trimmed to zero as part of the rebalance
+        all_relevant = set(st["positions"].keys()) | selected_tickers
+        for ticker in all_relevant:
+            if ticker in to_force_sell:
+                continue  # already selling it above
+            held = st["positions"].get(ticker, 0)
+            target = target_shares.get(ticker, 0)
+            delta = target - held
+            if delta > 0:
+                orders.append((ticker, "BUY", int(delta)))
+            elif delta < 0:
+                orders.append((ticker, "SELL", int(-delta)))
+
+        st["last_rebalance_bar"] = st["bar_count"]
+
+    # ---- 6. sells before buys (frees cash first, matches our own ledger sim) ----
+    sells = [o for o in orders if o[1] == "SELL"]
+    buys = [o for o in orders if o[1] == "BUY"]
+    final_orders = sells + buys
+
+    # ---- 7. remember what we submitted so we can settle it next call ----
+    st["pending_orders"] = list(final_orders)
+
+    return final_orders
+```
+
+**Why these choices:**
+- *Momentum + periodic rebalance* is a simple, robust, well-documented cross-sectional effect that doesn't require any external data beyond OHLCV, fits the "no network/file access" constraint, and diversifies risk across `TOP_N` names rather than betting on one instrument.
+- *Self-replayed fill simulation* is the only way to know cash/positions given the platform's silence on fills — and since the fill rule is fully specified and deterministic, replaying it is exact, not an approximation.
+- *Stop-loss + cash buffer* bound downside without needing shorting/leverage, which aren't available anyway.
+- *Incremental slicing of `history`* keeps runtime linear in total bars, comfortably inside the 60-minute budget regardless of run length.

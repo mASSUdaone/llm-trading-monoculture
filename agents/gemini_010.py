@@ -1,0 +1,259 @@
+import pandas as pd
+import numpy as np
+from collections import defaultdict, deque
+
+# Module-level state variables
+_cash = 100000.0
+_positions = {}          # ticker -> shares held (int)
+_pending_orders = []     # list of (ticker, direction, size) submitted at step t
+_last_processed_idx = 0
+_ticker_history = defaultdict(lambda: deque(maxlen=60))
+_peak_prices = {}        # ticker -> float (highest price since position entry)
+_entry_prices = {}       # ticker -> float (weighted average entry price)
+
+
+def init(cash: float):
+    """
+    Called exactly once before the backtest starts. Resets state.
+    """
+    global _cash, _positions, _pending_orders, _last_processed_idx
+    global _ticker_history, _peak_prices, _entry_prices
+
+    _cash = float(cash)
+    _positions = {}
+    _pending_orders = []
+    _last_processed_idx = 0
+    _ticker_history = defaultdict(lambda: deque(maxlen=60))
+    _peak_prices = {}
+    _entry_prices = {}
+
+
+def on_bar(history: pd.DataFrame) -> list:
+    """
+    Called once per time step. Returns a list of (ticker, direction, size) orders.
+    """
+    global _cash, _positions, _pending_orders, _last_processed_idx
+    global _ticker_history, _peak_prices, _entry_prices
+
+    if history is None or len(history) == 0:
+        return []
+
+    # Incremental processing: inspect only new rows appended since last bar
+    new_rows = history.iloc[_last_processed_idx:]
+    _last_processed_idx = len(history)
+
+    if len(new_rows) == 0:
+        return []
+
+    # Identify current timestamp bar
+    latest_timestamp = new_rows['timestamp'].iloc[-1]
+    current_bar_df = new_rows[new_rows['timestamp'] == latest_timestamp]
+
+    current_data = {}
+    for row in current_bar_df.itertuples(index=False):
+        t = row.ticker
+        open_p = float(row.open) if not pd.isna(row.open) else 0.0
+        high_p = float(row.high) if not pd.isna(row.high) else 0.0
+        low_p = float(row.low) if not pd.isna(row.low) else 0.0
+        close_p = float(row.close) if not pd.isna(row.close) else 0.0
+        vol = float(row.volume) if not pd.isna(row.volume) else 0.0
+
+        current_data[t] = {
+            'open': open_p,
+            'high': high_p,
+            'low': low_p,
+            'close': close_p,
+            'volume': vol
+        }
+
+    # ------------------------------------------------------------------------
+    # 1. Simulate Order Execution from Previous Bar (at Current Bar's Open)
+    # ------------------------------------------------------------------------
+    sells = [o for o in _pending_orders if o[1] == "SELL"]
+    buys = [o for o in _pending_orders if o[1] == "BUY"]
+
+    # Execute SELL orders first to free up cash
+    for ticker, direction, size in sells:
+        if ticker in current_data and current_data[ticker]['open'] > 0:
+            open_p = current_data[ticker]['open']
+            held = _positions.get(ticker, 0)
+            fill_shares = min(size, held)
+            if fill_shares > 0:
+                _cash += fill_shares * open_p
+                _positions[ticker] = held - fill_shares
+                if _positions[ticker] == 0:
+                    del _positions[ticker]
+                    _peak_prices.pop(ticker, None)
+                    _entry_prices.pop(ticker, None)
+
+    # Execute BUY orders second
+    for ticker, direction, size in buys:
+        if ticker in current_data and current_data[ticker]['open'] > 0:
+            open_p = current_data[ticker]['open']
+            max_affordable = int(_cash // open_p) if open_p > 0 else 0
+            fill_shares = min(size, max_affordable)
+            if fill_shares > 0:
+                cost = fill_shares * open_p
+                _cash -= cost
+                prev_shares = _positions.get(ticker, 0)
+                _positions[ticker] = prev_shares + fill_shares
+
+                # Track position entry and peak price
+                if prev_shares == 0:
+                    _entry_prices[ticker] = open_p
+                    _peak_prices[ticker] = open_p
+                else:
+                    prev_cost = prev_shares * _entry_prices.get(ticker, open_p)
+                    _entry_prices[ticker] = (prev_cost + cost) / (prev_shares + fill_shares)
+
+    # Reset pending orders after execution
+    _pending_orders = []
+
+    # ------------------------------------------------------------------------
+    # 2. Update Rolling Price Histories & Track Peak Prices
+    # ------------------------------------------------------------------------
+    for ticker, data in current_data.items():
+        _ticker_history[ticker].append(data)
+        if ticker in _positions:
+            c_p = data['close']
+            if c_p > 0:
+                _peak_prices[ticker] = max(_peak_prices.get(ticker, c_p), c_p)
+
+    # Compute Total Portfolio Valuation
+    portfolio_value = _cash
+    for t, shares in _positions.items():
+        if t in current_data and current_data[t]['close'] > 0:
+            portfolio_value += shares * current_data[t]['close']
+        elif t in _ticker_history and len(_ticker_history[t]) > 0:
+            portfolio_value += shares * _ticker_history[t][-1]['close']
+
+    # ------------------------------------------------------------------------
+    # 3. Alpha Factor Scoring & Signal Generation
+    # ------------------------------------------------------------------------
+    ticker_scores = {}
+    ticker_vols = {}
+    ticker_advs = {}
+
+    MIN_BARS = 15
+
+    for ticker, data_seq in _ticker_history.items():
+        if ticker not in current_data or len(data_seq) < MIN_BARS:
+            continue
+
+        closes = np.array([d['close'] for d in data_seq], dtype=np.float64)
+        volumes = np.array([d['volume'] for d in data_seq], dtype=np.float64)
+
+        if closes[-1] <= 0:
+            continue
+
+        rets = np.diff(closes) / closes[:-1]
+        if len(rets) == 0:
+            continue
+
+        vol_20 = np.std(rets) if len(rets) >= 5 else 0.02
+        if vol_20 <= 1e-6:
+            vol_20 = 0.02
+
+        # Factors:
+        ret_15 = (closes[-1] - closes[0]) / closes[0]
+        ret_3 = (closes[-1] - closes[-4]) / closes[-4] if len(closes) >= 4 else 0.0
+        sma_5 = np.mean(closes[-5:]) if len(closes) >= 5 else closes[-1]
+        stretch = (closes[-1] - sma_5) / sma_5
+        sharpe_15 = ret_15 / (vol_20 * np.sqrt(len(rets)) + 1e-4)
+
+        # Composite Alpha Score: Trend Sharpe + Medium Momentum - Short Stretch
+        raw_score = 0.5 * sharpe_15 + 0.3 * ret_15 - 0.2 * stretch
+
+        ticker_scores[ticker] = raw_score
+        ticker_vols[ticker] = vol_20
+        ticker_advs[ticker] = np.mean(volumes) if len(volumes) > 0 else 10000.0
+
+    # Cross-Sectional Z-Score Normalization
+    if len(ticker_scores) > 1:
+        scores_arr = np.array(list(ticker_scores.values()))
+        mean_s = np.mean(scores_arr)
+        std_s = np.std(scores_arr)
+        if std_s > 1e-6:
+            for t in ticker_scores:
+                ticker_scores[t] = (ticker_scores[t] - mean_s) / std_s
+
+    # Select target assets
+    sorted_tickers = sorted(ticker_scores.keys(), key=lambda k: ticker_scores[k], reverse=True)
+    target_count = min(10, max(3, len(ticker_scores) // 3)) if len(ticker_scores) > 0 else 0
+    target_tickers = [t for t in sorted_tickers[:target_count] if ticker_scores[t] > 0]
+
+    # Target allocations (Risk Parity / Inverse Volatility)
+    target_weights = {}
+    if len(target_tickers) > 0:
+        inv_vols = [1.0 / (ticker_vols[t] + 1e-4) for t in target_tickers]
+        tot_inv_vol = sum(inv_vols)
+        for t, iv in zip(target_tickers, inv_vols):
+            target_weights[t] = min(0.15, iv / tot_inv_vol)  # Cap single weight at 15%
+
+    target_shares = {}
+    capital_pool = portfolio_value * 0.90  # Target 90% invested, keep 10% cash buffer
+
+    for t in target_tickers:
+        close_p = current_data[t]['close']
+        if close_p > 0:
+            dollar_alloc = capital_pool * target_weights[t]
+            target_shares[t] = int(dollar_alloc // close_p)
+
+    # ------------------------------------------------------------------------
+    # 4. Construct Order List
+    # ------------------------------------------------------------------------
+    orders = []
+
+    # A. Check existing positions for risk exits or partial rebalance
+    held_tickers = list(_positions.keys())
+    for t in held_tickers:
+        held = _positions[t]
+        if held <= 0:
+            continue
+
+        c_p = current_data[t]['close'] if (t in current_data and current_data[t]['close'] > 0) else _ticker_history[t][-1]['close']
+        peak_p = _peak_prices.get(t, c_p)
+        entry_p = _entry_prices.get(t, c_p)
+
+        # Exit Rules
+        trailing_stop = (c_p < peak_p * 0.92)   # 8% drop from peak
+        hard_stop = (c_p < entry_p * 0.90)       # 10% loss from entry
+        alpha_exit = (t not in target_shares) or (t in ticker_scores and ticker_scores[t] < -0.3)
+
+        if trailing_stop or hard_stop or alpha_exit:
+            orders.append((str(t), "SELL", int(held)))
+            continue
+
+        # Rebalance sizing down
+        tgt = target_shares.get(t, 0)
+        diff = tgt - held
+        if diff < 0:
+            sell_qty = abs(diff)
+            if sell_qty * c_p > 300 or sell_qty > held * 0.2:
+                orders.append((str(t), "SELL", int(sell_qty)))
+
+    # B. Construct BUY orders for selected target assets
+    buy_candidates = [t for t in target_tickers if t in target_shares]
+    buy_candidates.sort(key=lambda x: ticker_scores.get(x, 0), reverse=True)
+
+    for t in buy_candidates:
+        tgt = target_shares[t]
+        held = _positions.get(t, 0)
+        diff = tgt - held
+        if diff > 0:
+            c_p = current_data[t]['close']
+            if c_p <= 0:
+                continue
+
+            # Liquidity rule: max 5% of 20-bar ADV
+            adv = ticker_advs.get(t, 10000.0)
+            max_liquidity_qty = max(1, int(adv * 0.05))
+            buy_qty = min(diff, max_liquidity_qty)
+
+            if buy_qty * c_p > 300:  # Minimum trade threshold
+                orders.append((str(t), "BUY", int(buy_qty)))
+
+    # Save pending orders for next bar simulation
+    _pending_orders = orders.copy()
+
+    return orders

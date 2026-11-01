@@ -1,0 +1,12 @@
+{
+  "index": 17,
+  "model": "claude-sonnet-5",
+  "temperature": 1.0,
+  "max_tokens": 32000,
+  "stop_reason": "end_turn",
+  "input_tokens": 652,
+  "output_tokens": 17815,
+  "prompt_sha256": "b382a0a3925df2a2a1983562b87c949ee024ff5717ee7273868b856c7a431da8",
+  "fenced": true,
+  "chars": 7125
+}

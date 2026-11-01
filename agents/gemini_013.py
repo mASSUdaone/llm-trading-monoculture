@@ -1,0 +1,200 @@
+from collections import deque
+import numpy as np
+import pandas as pd
+
+# Global state variables
+cash_balance = 0.0
+positions = {}          # ticker -> share count (int)
+pending_orders = []     # list of (ticker, direction, size) submitted on previous bar
+last_processed_idx = 0  # row index for incremental history processing
+ticker_history = {}     # ticker -> {'open': deque, 'close': deque, 'volume': deque}
+bar_count = 0
+
+
+def init(cash):
+    """
+    Called once before the first bar by the backtester platform.
+    Initializes trading agent state.
+    """
+    global cash_balance, positions, pending_orders, last_processed_idx, ticker_history, bar_count
+    cash_balance = float(cash)
+    positions = {}
+    pending_orders = []
+    last_processed_idx = 0
+    ticker_history = {}
+    bar_count = 0
+
+
+def on_bar(history):
+    """
+    Called once per time step with full history up to current bar.
+    Returns list of orders: [(ticker, direction, size), ...]
+    """
+    global cash_balance, positions, pending_orders, last_processed_idx, ticker_history, bar_count
+
+    n_rows = len(history)
+    if n_rows <= last_processed_idx:
+        return []
+
+    # Incremental update: process only new rows appended since last bar
+    new_df = history.iloc[last_processed_idx:n_rows]
+    last_processed_idx = n_rows
+
+    bar_count += 1
+
+    current_opens = {}
+    current_closes = {}
+
+    for row in new_df.itertuples(index=False):
+        ticker = row.ticker
+        c_open = float(row.open)
+        c_close = float(row.close)
+
+        if np.isnan(c_open) or np.isnan(c_close) or c_open <= 0 or c_close <= 0:
+            continue
+
+        current_opens[ticker] = c_open
+        current_closes[ticker] = c_close
+
+        if ticker not in ticker_history:
+            ticker_history[ticker] = {
+                'open': deque(maxlen=260),
+                'close': deque(maxlen=260),
+                'volume': deque(maxlen=260)
+            }
+
+        ticker_history[ticker]['open'].append(c_open)
+        ticker_history[ticker]['close'].append(c_close)
+        ticker_history[ticker]['volume'].append(float(row.volume))
+
+    # 1. Simulate fills for orders submitted at previous bar (executing at current open)
+    if pending_orders:
+        # Process SELLs first to free up cash
+        for ticker, direction, size in pending_orders:
+            if direction == "SELL":
+                held_shares = positions.get(ticker, 0)
+                if held_shares > 0 and ticker in current_opens:
+                    open_price = current_opens[ticker]
+                    exec_size = min(int(size), held_shares)
+                    if exec_size > 0:
+                        positions[ticker] = held_shares - exec_size
+                        cash_balance += exec_size * open_price
+                        if positions[ticker] == 0:
+                            del positions[ticker]
+
+        # Process BUYs using available cash
+        for ticker, direction, size in pending_orders:
+            if direction == "BUY":
+                if ticker in current_opens:
+                    open_price = current_opens[ticker]
+                    max_affordable = int(cash_balance // open_price)
+                    exec_size = min(int(size), max_affordable)
+                    if exec_size > 0:
+                        cash_balance -= exec_size * open_price
+                        positions[ticker] = positions.get(ticker, 0) + exec_size
+
+        pending_orders = []
+
+    # 2. Portfolio valuation at current close prices
+    total_portfolio_value = cash_balance
+    for ticker, shares in list(positions.items()):
+        if shares > 0:
+            if ticker in current_closes:
+                total_portfolio_value += shares * current_closes[ticker]
+            elif ticker in ticker_history and len(ticker_history[ticker]['close']) > 0:
+                total_portfolio_value += shares * ticker_history[ticker]['close'][-1]
+
+    total_portfolio_value = max(total_portfolio_value, 0.0)
+
+    # 3. Factor evaluation across active universe
+    scores = {}
+    vols = {}
+
+    for ticker, c_price in current_closes.items():
+        hist_closes = ticker_history[ticker]['close']
+        n = len(hist_closes)
+        if n < 30:
+            continue
+
+        closes_arr = np.array(hist_closes)
+
+        # Moving Averages
+        sma_20 = np.mean(closes_arr[-20:])
+        sma_50 = np.mean(closes_arr[-50:]) if n >= 50 else sma_20
+        sma_200 = np.mean(closes_arr[-200:]) if n >= 200 else sma_50
+
+        # Trend filter: Asset must trade above major moving averages
+        if c_price < sma_50 or c_price < sma_200 * 0.98:
+            continue
+
+        # Momentum calculation
+        mom_20 = (c_price / closes_arr[-21]) - 1.0 if n >= 21 else 0.0
+        mom_60 = (c_price / closes_arr[-61]) - 1.0 if n >= 61 else mom_20
+        mom_120 = (c_price / closes_arr[-121]) - 1.0 if n >= 121 else mom_60
+
+        composite_mom = 0.5 * mom_20 + 0.3 * mom_60 + 0.2 * mom_120
+        if composite_mom <= 0:
+            continue
+
+        # Volatility estimation (20-day returns standard deviation)
+        recent = closes_arr[-21:]
+        rets = np.diff(recent) / recent[:-1]
+        vol = float(np.std(rets))
+        if np.isnan(vol) or vol < 1e-4:
+            vol = 0.01
+
+        scores[ticker] = composite_mom
+        vols[ticker] = vol
+
+    # 4. Target weight allocation (Top K assets by composite momentum)
+    target_weights = {}
+    k_select = 10
+    top_tickers = sorted(scores.keys(), key=lambda t: scores[t], reverse=True)[:k_select]
+
+    if top_tickers:
+        inv_vols = {t: 1.0 / vols[t] for t in top_tickers}
+        sum_inv = sum(inv_vols.values())
+
+        # Target 95% total invested capital, keeping 5% cash buffer
+        raw_weights = {t: (inv_vols[t] / sum_inv) * 0.95 for t in top_tickers}
+
+        # Cap max position size at 20%
+        max_w = 0.20
+        for t, w in raw_weights.items():
+            target_weights[t] = min(w, max_w)
+
+    # 5. Generate orders
+    sells = []
+    buys = []
+    is_rebalance_bar = (bar_count % 5 == 0)
+
+    all_tickers = set(positions.keys()).union(target_weights.keys())
+
+    for ticker in all_tickers:
+        if ticker not in current_closes:
+            continue
+
+        price = current_closes[ticker]
+        if price <= 0:
+            continue
+
+        cur_shares = positions.get(ticker, 0)
+        tgt_weight = target_weights.get(ticker, 0.0)
+        tgt_shares = int((total_portfolio_value * tgt_weight) // price)
+
+        diff = tgt_shares - cur_shares
+        is_exit = (tgt_weight == 0 and cur_shares > 0)
+        significant_change = abs(diff * price) > 200.0
+
+        if is_exit or (is_rebalance_bar and significant_change):
+            if diff < 0:
+                sell_qty = min(cur_shares, abs(diff))
+                if sell_qty > 0:
+                    sells.append((ticker, "SELL", int(sell_qty)))
+            elif diff > 0 and is_rebalance_bar:
+                buys.append((ticker, "BUY", int(diff)))
+
+    # Return SELL orders first to liquidate capital before executing BUY orders
+    orders = sells + buys
+    pending_orders = orders
+    return orders

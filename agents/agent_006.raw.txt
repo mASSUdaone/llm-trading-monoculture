@@ -1,0 +1,245 @@
+## Approach
+
+Since the platform gives no fill confirmations, cash balances, or position reports, the agent has to be its own bookkeeper. The core design principle is: **track cash/positions internally exactly, and only ever submit orders whose fills you can predict with certainty** (buy sizes capped at cash-on-hand, sell sizes capped at shares-on-hand). Since orders fill at the *next* bar's open, and the next call to `on_bar` receives that open price, the agent "settles" its own pending orders at the start of each new call before deciding anything else — keeping its internal ledger in sync with what the platform is actually doing.
+
+**Strategy: cross-sectional momentum with volatility-scaled sizing.**
+
+- Every bar, roll a fixed-length close-price window per ticker (cheap, O(1) amortized per bar using `deque(maxlen=LOOKBACK)`; new rows are found via `history.iloc[prev_len:]` rather than rescanning the whole DataFrame, so the whole run stays roughly O(total rows) instead of O(n²)).
+- Every `REBALANCE_PERIOD` bars: rank all tickers with a full lookback window by trailing momentum (`close[-1]/close[0] - 1`). Keep the top `TOP_N` with **positive** momentum only (no shorting is allowed anyway).
+- Size positions by **inverse volatility** (calmer trending names get bigger weight) scaled to `INVEST_FRACTION` of portfolio value, leaving a cash cushion.
+- Diff target shares vs. currently-held shares to get buy/sell orders. Sells for de-selected names go first (conceptually), buys are capped so their cumulative cost never exceeds tracked cash.
+- **Every bar** (not just rebalance bars), a hard per-position stop-loss is checked against average cost basis, independent of the momentum schedule, and fires a full exit if breached.
+- Internal fills replicate the platform's "largest possible quantity" partial-fill rule exactly, so the internal ledger can't drift out of sync with reality (barring a ticker vanishing from the data entirely while held, an unavoidable edge case with no price at all).
+
+```python
+import numpy as np
+import pandas as pd
+from collections import deque
+
+# ---------------------------------------------------------------------------
+# Strategy parameters
+# ---------------------------------------------------------------------------
+LOOKBACK = 60            # bars used to measure momentum / volatility
+REBALANCE_PERIOD = 5     # rebalance the book every N bars
+WARMUP = LOOKBACK + 1    # bars to wait before trading starts
+TOP_N = 8                # number of names held at once
+INVEST_FRACTION = 0.90   # fraction of portfolio value we try to keep invested
+STOP_LOSS_PCT = 0.15     # hard per-position stop loss
+MIN_TRADE_DOLLARS = 50.0 # ignore tiny rebalance trades
+MIN_MOMENTUM = 0.0       # only go long names with positive trailing momentum
+
+# ---------------------------------------------------------------------------
+# Module level state (the platform gives us no fill reports, so we keep our
+# own ledger and update it ourselves using the exact same fill rules the
+# platform uses).
+# ---------------------------------------------------------------------------
+_cash = 0.0
+_positions = {}       # ticker -> shares held
+_entry_price = {}     # ticker -> average cost basis
+_price_hist = {}      # ticker -> deque of recent closes (len LOOKBACK)
+_bar_count = 0
+_pending_orders = []  # orders submitted last bar, filled this bar at open
+_prev_len = 0
+
+
+def init(cash):
+    global _cash, _positions, _entry_price, _price_hist
+    global _bar_count, _pending_orders, _prev_len
+    _cash = float(cash)
+    _positions = {}
+    _entry_price = {}
+    _price_hist = {}
+    _bar_count = 0
+    _pending_orders = []
+    _prev_len = 0
+
+
+def _valid(price):
+    return price is not None and not pd.isna(price) and price > 0
+
+
+def _fill_pending_orders(open_map):
+    """Settle the orders we submitted on the previous bar using this bar's
+    open prices, replicating the platform's partial-fill rule so our
+    internal cash/position ledger stays exactly in sync."""
+    global _cash
+    for ticker, direction, size in _pending_orders:
+        price = open_map.get(ticker)
+        if not _valid(price) or size <= 0:
+            continue  # no price available -> fills for zero shares
+
+        if direction == "BUY":
+            affordable = int(_cash // price)
+            qty = min(size, affordable)
+            if qty <= 0:
+                continue
+            cost = qty * price
+            prev_shares = _positions.get(ticker, 0)
+            prev_cost = _entry_price.get(ticker, price) * prev_shares
+            new_shares = prev_shares + qty
+            _entry_price[ticker] = (prev_cost + cost) / new_shares
+            _positions[ticker] = new_shares
+            _cash -= cost
+
+        elif direction == "SELL":
+            held = _positions.get(ticker, 0)
+            qty = min(size, held)
+            if qty <= 0:
+                continue
+            _cash += qty * price
+            remaining = held - qty
+            if remaining <= 0:
+                _positions.pop(ticker, None)
+                _entry_price.pop(ticker, None)
+            else:
+                _positions[ticker] = remaining
+
+
+def _check_stop_loss(close_map):
+    orders = []
+    triggered = set()
+    for ticker, shares in list(_positions.items()):
+        if shares <= 0:
+            continue
+        price = close_map.get(ticker)
+        entry = _entry_price.get(ticker)
+        if not _valid(price) or entry is None:
+            continue
+        if price <= entry * (1.0 - STOP_LOSS_PCT):
+            orders.append((ticker, "SELL", int(shares)))
+            triggered.add(ticker)
+    return orders, triggered
+
+
+def _portfolio_value(close_map):
+    value = _cash
+    for ticker, shares in _positions.items():
+        price = close_map.get(ticker)
+        if not _valid(price):
+            price = _entry_price.get(ticker, 0.0)
+        value += shares * price
+    return value
+
+
+def _rebalance(close_map, excluded):
+    orders = []
+    candidates = []
+
+    for ticker, buf in _price_hist.items():
+        if ticker in excluded:
+            continue
+        if len(buf) < LOOKBACK:
+            continue
+        closes = np.asarray(buf, dtype=float)
+        start = closes[0]
+        if start <= 0:
+            continue
+        mom = closes[-1] / start - 1.0
+        if mom <= MIN_MOMENTUM:
+            continue
+        rets = np.diff(closes) / closes[:-1]
+        vol = float(np.std(rets))
+        if vol <= 1e-8:
+            continue
+        candidates.append((ticker, mom, vol))
+
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    selected = candidates[:TOP_N]
+
+    inv_vol = {t: 1.0 / v for t, _, v in selected}
+    total_inv_vol = sum(inv_vol.values())
+
+    port_value = _portfolio_value(close_map)
+    target_shares = {}
+    if total_inv_vol > 0:
+        for ticker, _, _ in selected:
+            weight = inv_vol[ticker] / total_inv_vol
+            dollars = port_value * INVEST_FRACTION * weight
+            price = close_map.get(ticker)
+            if _valid(price):
+                target_shares[ticker] = int(dollars // price)
+
+    selected_tickers = set(target_shares.keys())
+
+    # exit positions no longer selected (skip ones already handled by stop loss)
+    for ticker, shares in list(_positions.items()):
+        if ticker in excluded:
+            continue
+        if ticker not in selected_tickers and shares > 0:
+            orders.append((ticker, "SELL", int(shares)))
+
+    # trims: sell down to target where target < held
+    for ticker, tgt in target_shares.items():
+        held = _positions.get(ticker, 0)
+        if tgt < held:
+            price = close_map.get(ticker, 0.0)
+            delta = held - tgt
+            if _valid(price) and price * delta >= MIN_TRADE_DOLLARS:
+                orders.append((ticker, "SELL", int(delta)))
+
+    # buys: cap cumulative spend at cash we actually have tracked
+    available_cash = _cash
+    for ticker, tgt in target_shares.items():
+        held = _positions.get(ticker, 0)
+        if tgt > held:
+            price = close_map.get(ticker, 0.0)
+            if not _valid(price):
+                continue
+            delta = tgt - held
+            dollar_amt = price * delta
+            if dollar_amt < MIN_TRADE_DOLLARS:
+                continue
+            affordable_qty = int(available_cash // price)
+            qty = min(delta, affordable_qty)
+            if qty <= 0:
+                continue
+            orders.append((ticker, "BUY", int(qty)))
+            available_cash -= qty * price
+
+    return orders
+
+
+def on_bar(history):
+    global _bar_count, _pending_orders, _prev_len
+
+    n = len(history)
+    new_rows = history.iloc[_prev_len:n]
+    _prev_len = n
+
+    if new_rows.empty:
+        return []
+
+    open_map = dict(zip(new_rows['ticker'], new_rows['open']))
+    close_map = dict(zip(new_rows['ticker'], new_rows['close']))
+
+    # 1. settle orders placed on the previous bar using this bar's open
+    _fill_pending_orders(open_map)
+
+    # 2. update rolling close-price history used for signals
+    for ticker, c in close_map.items():
+        if not _valid(c):
+            continue
+        buf = _price_hist.get(ticker)
+        if buf is None:
+            buf = deque(maxlen=LOOKBACK)
+            _price_hist[ticker] = buf
+        buf.append(float(c))
+
+    _bar_count += 1
+
+    # 3. stop-loss checks happen every bar
+    stop_orders, triggered = _check_stop_loss(close_map)
+    orders = list(stop_orders)
+
+    # 4. periodic momentum rebalance
+    if _bar_count >= WARMUP and _bar_count % REBALANCE_PERIOD == 0:
+        orders += _rebalance(close_map, triggered)
+
+    _pending_orders = orders
+    return orders
+```
+
+**Notes on robustness/perf:**
+- `history.iloc[_prev_len:]` avoids rescanning the whole (growing) DataFrame every bar — the module only ever looks at the newly appended rows, keeping total work roughly linear in the number of rows over the whole run.
+- All sizing decisions are made against the agent's own tracked cash/shares, never against unknown platform state, so no order can ever be rejected for insufficient funds/shares (except the unavoidable "no price available" case, which is checked for explicitly).
+- Momentum + inverse-vol sizing + a hard stop loss gives a straightforward trend-following posture with built-in diversification (up to `TOP_N` names) and downside control, while keeping a cash buffer (`INVEST_FRACTION < 1`) as a further risk cushion.

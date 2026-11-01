@@ -1,0 +1,266 @@
+Here is the complete quantitative trading agent implementation.
+
+### Strategy Architecture
+
+1. **State Tracking & Order Resolution**:
+   - Because fill reports are not provided, the agent tracks its cash and positions internally.
+   - At time step $t$, before generating new signals, the agent inspects the newly received `open` prices for timestamp $t$ to execute the pending orders submitted at step $t-1$.
+   - SELL orders are executed first to free up capital, followed by BUY orders subject to remaining cash.
+
+2. **Cross-Sectional Ranking & Momentum Filter**:
+   - For every active asset with sufficient price history ($\ge 20$ bars), the agent evaluates trend alignment (e.g., $Close > SMA_{10} \ge SMA_{30}$) and positive returns ($R_{20} > 0$).
+   - Assets passing the trend filter are scored by risk-adjusted momentum (Sharpe ratio equivalent: $R_{20} / \sigma_{20}$).
+
+3. **Risk Parity & Capital Allocation**:
+   - Selects up to the top 5 highest-scoring assets.
+   - Allocates capital inversely proportional to daily volatility (Risk Parity), capping individual positions at 30% of portfolio equity and retaining a 5% cash buffer to accommodate price slippage/gaps.
+   - Assets failing trend or momentum filters receive zero weight, causing the agent to exit positions automatically during market downturns.
+
+4. **Execution & Rebalancing**:
+   - Compares target share counts against current holdings.
+   - Emits order tuples `(ticker, "BUY"/"SELL", size)` with integer share quantities, sorting SELL orders first to maximize liquid cash for BUY orders.
+
+---
+
+### Python Code
+
+```python
+import numpy as np
+import pandas as pd
+from collections import defaultdict, deque
+
+# Global state variables
+_cash = 100000.0
+_positions = defaultdict(int)
+_pending_orders = []
+_price_history = defaultdict(lambda: {
+    'open': deque(maxlen=60),
+    'high': deque(maxlen=60),
+    'low': deque(maxlen=60),
+    'close': deque(maxlen=60),
+    'volume': deque(maxlen=60)
+})
+_last_processed_idx = 0
+
+
+def init(cash: float) -> None:
+    """Initialize or reset trading agent state."""
+    global _cash, _positions, _pending_orders, _price_history, _last_processed_idx
+    _cash = float(cash)
+    _positions = defaultdict(int)
+    _pending_orders = []
+    _price_history = defaultdict(lambda: {
+        'open': deque(maxlen=60),
+        'high': deque(maxlen=60),
+        'low': deque(maxlen=60),
+        'close': deque(maxlen=60),
+        'volume': deque(maxlen=60)
+    })
+    _last_processed_idx = 0
+
+
+def _calculate_signal(closes: deque) -> tuple[float, float]:
+    """
+    Calculate trend quality and risk-adjusted momentum score for a ticker.
+    Returns (score, volatility).
+    """
+    n = len(closes)
+    if n < 20:
+        return -999.0, 0.0
+
+    prices = np.array(closes, dtype=float)
+    
+    # Calculate simple moving averages
+    sma_fast = np.mean(prices[-10:])
+    sma_slow = np.mean(prices[-30:]) if n >= 30 else np.mean(prices)
+    
+    curr_price = prices[-1]
+    
+    # Trend filter: Current price > Fast SMA and Fast SMA >= Slow SMA
+    is_uptrend = (curr_price > sma_fast) and (sma_fast >= sma_slow)
+    if not is_uptrend:
+        return -999.0, 0.0
+
+    # Returns and Volatility over 20-bar lookback
+    lookback = min(20, n - 1)
+    past_price = prices[-lookback - 1]
+    if past_price <= 0:
+        return -999.0, 0.0
+
+    ret_20 = (curr_price - past_price) / past_price
+    if ret_20 <= 0:
+        return -999.0, 0.0
+
+    # Daily percentage changes
+    daily_returns = np.diff(prices[-lookback - 1:]) / prices[-lookback - 1:-1]
+    vol = np.std(daily_returns)
+    if vol < 1e-4:
+        vol = 1e-4
+
+    # Risk-adjusted momentum score
+    score = ret_20 / vol
+    return float(score), float(vol)
+
+
+def on_bar(history: pd.DataFrame) -> list[tuple[str, str, int]]:
+    """
+    Process new bar data, track fills, compute quantitative signals,
+    and generate optimal rebalancing orders.
+    """
+    global _cash, _positions, _pending_orders, _price_history, _last_processed_idx
+
+    n_rows = len(history)
+    if n_rows <= _last_processed_idx:
+        return []
+
+    # Extract new rows appended since last call
+    new_data = history.iloc[_last_processed_idx:n_rows]
+    _last_processed_idx = n_rows
+
+    latest_opens = {}
+    
+    # Update price histories and extract latest execution open prices
+    for row in new_data.itertuples(index=False):
+        ticker = row.ticker
+        c = row.close
+        o = row.open
+        
+        if pd.notna(c) and c > 0:
+            _price_history[ticker]['open'].append(float(o) if pd.notna(o) else float(c))
+            _price_history[ticker]['high'].append(float(row.high) if pd.notna(row.high) else float(c))
+            _price_history[ticker]['low'].append(float(row.low) if pd.notna(row.low) else float(c))
+            _price_history[ticker]['close'].append(float(c))
+            _price_history[ticker]['volume'].append(float(row.volume) if pd.notna(row.volume) else 0.0)
+
+        if pd.notna(o) and o > 0:
+            latest_opens[ticker] = float(o)
+
+    # 1. Resolve pending order fills using execution bar's OPEN prices
+    if _pending_orders:
+        sells = [o for o in _pending_orders if o[1] == "SELL"]
+        buys = [o for o in _pending_orders if o[1] == "BUY"]
+
+        # Process SELL orders first (frees cash balance)
+        for ticker, _, size in sells:
+            if ticker in latest_opens:
+                open_px = latest_opens[ticker]
+                held_qty = _positions.get(ticker, 0)
+                fill_qty = min(size, held_qty)
+                if fill_qty > 0:
+                    _positions[ticker] -= fill_qty
+                    _cash += fill_qty * open_px
+                    if _positions[ticker] == 0:
+                        del _positions[ticker]
+
+        # Process BUY orders second
+        for ticker, _, size in buys:
+            if ticker in latest_opens:
+                open_px = latest_opens[ticker]
+                max_buyable = int(_cash / open_px) if open_px > 0 else 0
+                fill_qty = max(0, min(size, max_buyable))
+                if fill_qty > 0:
+                    _cash -= fill_qty * open_px
+                    _positions[ticker] += fill_qty
+
+        _pending_orders = []
+
+    # 2. Portfolio Valuation
+    portfolio_val = _cash
+    for ticker, qty in list(_positions.items()):
+        if qty > 0 and len(_price_history[ticker]['close']) > 0:
+            portfolio_val += qty * _price_history[ticker]['close'][-1]
+
+    if portfolio_val <= 0:
+        return []
+
+    # 3. Compute Signals across all tracked assets
+    candidate_scores = {}
+    candidate_vols = {}
+
+    for ticker, data in _price_history.items():
+        closes = data['close']
+        score, vol = _calculate_signal(closes)
+        if score > 0 and vol > 0:
+            candidate_scores[ticker] = score
+            candidate_vols[ticker] = vol
+
+    # Select top K candidates (max 5)
+    max_positions = 5
+    sorted_candidates = sorted(candidate_scores.keys(), key=lambda t: candidate_scores[t], reverse=True)
+    selected_tickers = sorted_candidates[:max_positions]
+
+    # 4. Target Allocation Sizing (Risk Parity / Volatility-weighted)
+    target_weights = {}
+    if selected_tickers:
+        inv_vols = {t: 1.0 / candidate_vols[t] for t in selected_tickers}
+        total_inv_vol = sum(inv_vols.values())
+        
+        # Allocate up to 95% of total portfolio value (5% cash buffer)
+        max_equity_allocation = 0.95
+        for t in selected_tickers:
+            raw_w = max_equity_allocation * (inv_vols[t] / total_inv_vol)
+            # Cap maximum weight per single asset at 30%
+            target_weights[t] = min(0.30, raw_w)
+
+    # 5. Determine Target Share Counts
+    target_shares = {}
+    for ticker in selected_tickers:
+        w = target_weights[ticker]
+        est_price = _price_history[ticker]['close'][-1]
+        target_val = portfolio_val * w
+        target_shares[ticker] = int(target_val / est_price)
+
+    # 6. Generate Rebalancing Orders
+    sell_orders = []
+    buy_candidates = []
+
+    # Check held positions for exits or downsizing
+    all_held = list(_positions.keys())
+    for ticker in all_held:
+        held_qty = _positions[ticker]
+        desired_qty = target_shares.get(ticker, 0)
+
+        if desired_qty == 0:
+            # Exit position completely
+            sell_orders.append((ticker, "SELL", int(held_qty)))
+        elif desired_qty < held_qty:
+            # Downsize position if diff is significant (>8% of position or > $500)
+            diff = held_qty - desired_qty
+            est_price = _price_history[ticker]['close'][-1]
+            if (diff / held_qty > 0.08) or (diff * est_price > 500.0):
+                sell_orders.append((ticker, "SELL", int(diff)))
+
+    # Identify potential BUY orders
+    for ticker in selected_tickers:
+        held_qty = _positions.get(ticker, 0)
+        desired_qty = target_shares.get(ticker, 0)
+
+        if desired_qty > held_qty:
+            diff = desired_qty - held_qty
+            est_price = _price_history[ticker]['close'][-1]
+            # Only buy if trade size is meaningful (> $200 value or opening new position)
+            if (held_qty == 0 and diff * est_price >= 200.0) or (held_qty > 0 and (diff / held_qty > 0.08 or diff * est_price >= 500.0)):
+                buy_candidates.append((ticker, diff, est_price))
+
+    # Size BUY orders sequentially against remaining cash reserve
+    buy_orders = []
+    available_cash = _cash * 0.95  # Preserve safety buffer
+    
+    # Sort buy candidates by score (highest priority buys first)
+    buy_candidates.sort(key=lambda x: candidate_scores.get(x[0], 0), reverse=True)
+
+    for ticker, diff, est_price in buy_candidates:
+        if available_cash <= 0 or est_price <= 0:
+            break
+        max_affordable = int(available_cash / est_price)
+        actual_buy = min(diff, max_affordable)
+        if actual_buy > 0:
+            buy_orders.append((ticker, "BUY", int(actual_buy)))
+            available_cash -= actual_buy * est_price
+
+    # Combine orders putting SELLs first, then BUYs
+    orders = sell_orders + buy_orders
+    _pending_orders = orders
+
+    return orders
+```

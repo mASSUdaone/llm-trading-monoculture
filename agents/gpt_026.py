@@ -1,0 +1,367 @@
+import math
+from collections import defaultdict, deque
+
+import numpy as np
+
+
+# Strategy:
+# - Cross-sectional momentum and trend following.
+# - Holds up to 6 liquid stocks with strong 1-3 month momentum,
+#   positive medium-term trend, and relatively low volatility.
+# - Rebalances every 5 bars.
+# - Uses a 12% trailing stop and a 50-bar moving-average exit.
+# - Keeps roughly 10% cash when fully invested.
+#
+# The agent maintains its own accounting because the platform does not provide
+# fills or account statements. Pending orders are reconciled at the next bar's
+# open using the documented fill rules.
+
+
+_INITIAL_CASH = 0.0
+_cash = 0.0
+_positions = {}
+_pending_orders = []
+
+_seen_rows = 0
+_bar_number = 0
+
+_close_history = defaultdict(lambda: deque(maxlen=80))
+_dollar_volume_history = defaultdict(lambda: deque(maxlen=30))
+_last_price = {}
+_peak_price = {}
+
+_MAX_HOLDINGS = 6
+_REBALANCE_EVERY = 5
+_CASH_RESERVE = 0.10
+
+
+def init(cash):
+    global _INITIAL_CASH, _cash, _positions, _pending_orders
+    global _seen_rows, _bar_number
+    global _close_history, _dollar_volume_history, _last_price, _peak_price
+
+    _INITIAL_CASH = float(cash)
+    _cash = float(cash)
+
+    _positions = {}
+    _pending_orders = []
+
+    _seen_rows = 0
+    _bar_number = 0
+
+    _close_history = defaultdict(lambda: deque(maxlen=80))
+    _dollar_volume_history = defaultdict(lambda: deque(maxlen=30))
+    _last_price = {}
+    _peak_price = {}
+
+
+def _valid_price(value):
+    try:
+        return math.isfinite(float(value)) and float(value) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _execute_pending_orders(current_bars):
+    """
+    Reconstruct fills for orders submitted on the preceding bar.
+
+    Orders are processed in the same returned order. The strategy always
+    returns sells before buys, allowing sale proceeds to fund later purchases.
+    """
+    global _cash, _pending_orders
+
+    if not _pending_orders:
+        return
+
+    open_prices = {}
+    for row in current_bars.itertuples(index=False):
+        ticker = row.ticker
+        price = row.open
+        if _valid_price(price):
+            open_prices[ticker] = float(price)
+
+    for ticker, direction, requested_size in _pending_orders:
+        requested_size = int(requested_size)
+        if requested_size <= 0:
+            continue
+
+        price = open_prices.get(ticker)
+        if price is None:
+            # The documented behavior: no price means zero fill.
+            continue
+
+        if direction == "SELL":
+            held = int(_positions.get(ticker, 0))
+            filled = min(held, requested_size)
+
+            if filled > 0:
+                _positions[ticker] = held - filled
+                _cash += filled * price
+
+                if _positions[ticker] <= 0:
+                    _positions.pop(ticker, None)
+                    _peak_price.pop(ticker, None)
+
+        elif direction == "BUY":
+            affordable = int(_cash // price)
+            filled = min(affordable, requested_size)
+
+            if filled > 0:
+                old_shares = int(_positions.get(ticker, 0))
+                _positions[ticker] = old_shares + filled
+                _cash -= filled * price
+
+                if old_shares == 0:
+                    _peak_price[ticker] = price
+                else:
+                    _peak_price[ticker] = max(
+                        _peak_price.get(ticker, price),
+                        price,
+                    )
+
+    _pending_orders = []
+
+
+def _portfolio_value():
+    value = _cash
+
+    for ticker, shares in _positions.items():
+        price = _last_price.get(ticker)
+        if price is not None and _valid_price(price):
+            value += int(shares) * float(price)
+
+    return value
+
+
+def _score_ticker(ticker):
+    """
+    Return a risk-adjusted momentum score, or None if insufficient history.
+
+    Required data:
+      - 64 closes for approximately 3-month momentum
+      - 20 dollar-volume observations for liquidity filtering
+    """
+    closes = _close_history[ticker]
+    dollar_volumes = _dollar_volume_history[ticker]
+
+    if len(closes) < 64 or len(dollar_volumes) < 20:
+        return None
+
+    c = np.asarray(closes, dtype=float)
+    dv = np.asarray(dollar_volumes, dtype=float)
+
+    if (
+        not np.all(np.isfinite(c[-64:]))
+        or not np.all(np.isfinite(dv[-20:]))
+        or c[-1] <= 0
+    ):
+        return None
+
+    # Avoid thin / illiquid securities.
+    median_dollar_volume = float(np.median(dv[-20:]))
+    if median_dollar_volume < 1_000_000.0:
+        return None
+
+    current = float(c[-1])
+    return_20 = current / float(c[-21]) - 1.0
+    return_63 = current / float(c[-64]) - 1.0
+
+    sma_20 = float(np.mean(c[-20:]))
+    sma_50 = float(np.mean(c[-50:]))
+
+    # Only own stocks in established uptrends.
+    if current <= sma_50 or sma_20 <= sma_50:
+        return None
+
+    log_returns = np.diff(np.log(c[-22:]))
+    volatility = float(np.std(log_returns, ddof=1))
+
+    if not math.isfinite(volatility) or volatility < 0.002:
+        return None
+
+    # Blend shorter and medium term momentum, normalized by recent volatility.
+    raw_momentum = 0.45 * return_20 + 0.55 * return_63
+    if raw_momentum <= 0:
+        return None
+
+    # Small preference for stronger trend separation above the 50-bar average.
+    trend_bonus = (current / sma_50) - 1.0
+    score = (raw_momentum + 0.25 * trend_bonus) / volatility
+
+    if not math.isfinite(score):
+        return None
+
+    return score
+
+
+def _stop_orders(current_prices):
+    """
+    Risk exits are checked every bar rather than only on rebalance bars.
+    """
+    orders = []
+
+    for ticker, shares in list(_positions.items()):
+        price = current_prices.get(ticker)
+        if price is None or shares <= 0:
+            continue
+
+        closes = _close_history[ticker]
+        peak = _peak_price.get(ticker, price)
+
+        if price > peak:
+            peak = price
+            _peak_price[ticker] = peak
+
+        trailing_stop_hit = price < peak * 0.88
+
+        moving_average_exit = False
+        if len(closes) >= 50:
+            sma_50 = float(np.mean(np.asarray(closes, dtype=float)[-50:]))
+            moving_average_exit = price < sma_50 * 0.97
+
+        if trailing_stop_hit or moving_average_exit:
+            orders.append((ticker, "SELL", int(shares)))
+
+    return orders
+
+
+def _rebalance_orders(current_prices):
+    """
+    Select the strongest candidates and move positions toward equal weights.
+    """
+    scores = []
+
+    for ticker in current_prices:
+        score = _score_ticker(ticker)
+        if score is not None:
+            scores.append((score, ticker))
+
+    if not scores:
+        return []
+
+    scores.sort(reverse=True)
+    ranked_tickers = [ticker for _, ticker in scores]
+
+    # Hysteresis: current holdings may remain if still in the top 12,
+    # reducing unnecessary turnover around the selection cutoff.
+    top_twelve = set(ranked_tickers[:12])
+    desired = []
+
+    for ticker in ranked_tickers:
+        if ticker in _positions and ticker in top_twelve:
+            desired.append(ticker)
+            if len(desired) >= _MAX_HOLDINGS:
+                break
+
+    for ticker in ranked_tickers:
+        if ticker not in desired:
+            desired.append(ticker)
+            if len(desired) >= _MAX_HOLDINGS:
+                break
+
+    desired_set = set(desired)
+    orders = []
+
+    # Sells come first so their execution proceeds can fund purchases.
+    for ticker, shares in list(_positions.items()):
+        if ticker in current_prices and ticker not in desired_set and shares > 0:
+            orders.append((ticker, "SELL", int(shares)))
+
+    if not desired:
+        return orders
+
+    equity = _portfolio_value()
+    investable_equity = equity * (1.0 - _CASH_RESERVE)
+    target_value = investable_equity / len(desired)
+
+    # Buy only when a holding is materially below target. This is intentionally
+    # a wide band to limit churn caused by small ranking and price changes.
+    for ticker in desired:
+        price = current_prices.get(ticker)
+        if price is None or price <= 0:
+            continue
+
+        held = int(_positions.get(ticker, 0))
+        current_value = held * price
+
+        if current_value < target_value * 0.80:
+            desired_shares = int(target_value // price)
+            buy_size = desired_shares - held
+
+            if buy_size > 0:
+                orders.append((ticker, "BUY", int(buy_size)))
+
+    return orders
+
+
+def on_bar(history):
+    global _seen_rows, _bar_number, _pending_orders
+
+    # The history DataFrame is append-only. Newly appended rows are precisely
+    # the current timestamp's bars.
+    current_bars = history.iloc[_seen_rows:]
+    _seen_rows = len(history)
+
+    if current_bars.empty:
+        return []
+
+    # First reconcile fills from orders placed on the prior bar's close.
+    _execute_pending_orders(current_bars)
+
+    _bar_number += 1
+    current_prices = {}
+
+    # Update market data state using the current completed bar.
+    for row in current_bars.itertuples(index=False):
+        ticker = row.ticker
+        close = row.close
+
+        if not _valid_price(close):
+            continue
+
+        close = float(close)
+        current_prices[ticker] = close
+        _last_price[ticker] = close
+        _close_history[ticker].append(close)
+
+        try:
+            volume = float(row.volume)
+        except (TypeError, ValueError):
+            volume = 0.0
+
+        if math.isfinite(volume) and volume >= 0:
+            _dollar_volume_history[ticker].append(close * volume)
+        else:
+            _dollar_volume_history[ticker].append(0.0)
+
+    # Stops have priority over ordinary rebalancing.
+    stops = _stop_orders(current_prices)
+    if stops:
+        _pending_orders = stops
+        return stops
+
+    # Wait until enough price history exists, then rebalance weekly.
+    if _bar_number < 65 or (_bar_number % _REBALANCE_EVERY) != 0:
+        return []
+
+    orders = _rebalance_orders(current_prices)
+
+    # Defensive cleanup: no zero-sized or duplicate sell orders.
+    cleaned = []
+    seen_sells = set()
+
+    for ticker, direction, size in orders:
+        size = int(size)
+        if size <= 0:
+            continue
+
+        if direction == "SELL":
+            if ticker in seen_sells:
+                continue
+            seen_sells.add(ticker)
+
+        cleaned.append((ticker, direction, size))
+
+    _pending_orders = cleaned
+    return cleaned

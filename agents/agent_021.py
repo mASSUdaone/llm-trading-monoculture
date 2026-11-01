@@ -1,0 +1,211 @@
+import numpy as np
+import pandas as pd
+
+# ----------------------------------------------------------------------
+# Module-level state (the platform imports this module once and calls
+# init() then on_bar() repeatedly, so ordinary module globals are fine).
+# ----------------------------------------------------------------------
+_state = {}
+
+
+def init(cash):
+    """Called exactly once, before the first bar."""
+    _state.clear()
+    _state['cash'] = float(cash)
+    _state['positions'] = {}          # ticker -> shares held (int)
+    _state['pending_orders'] = []     # orders submitted last call, to settle now
+    _state['timestamps'] = []         # ordered list of unique timestamps seen
+    _state['bar_count'] = 0
+    _state['last_rebalance_bar'] = -10 ** 9
+
+    # ---- strategy parameters (tunable) ----
+    _state['lookback_mom'] = 90        # momentum lookback, in bars
+    _state['lookback_vol'] = 20        # volatility lookback, in bars
+    _state['rebalance_period'] = 10    # rebalance cadence, in bars
+    _state['top_n'] = 8                # number of names held at once
+    _state['invest_fraction'] = 0.95   # fraction of equity to deploy
+    _state['min_history'] = 100        # bars required before trading starts
+    _state['cash_buffer'] = 0.97       # safety haircut applied to buy orders
+
+
+def _process_pending_orders(open_prices):
+    """
+    Simulate the fills of orders we submitted on the previous bar, using
+    this bar's open prices. This mirrors the platform's own fill logic
+    (largest affordable/available quantity fills, no borrowing/shorting)
+    so our internal cash/position bookkeeping stays in sync with reality,
+    even though the platform never reports fills back to us.
+    """
+    positions = _state['positions']
+    cash = _state['cash']
+
+    for ticker, direction, size in _state['pending_orders']:
+        try:
+            price = open_prices.get(ticker)
+            if price is None or not np.isfinite(price) or price <= 0 or size <= 0:
+                continue
+
+            if direction == 'BUY':
+                affordable = int(cash // price)
+                qty = min(int(size), affordable)
+                if qty > 0:
+                    cash -= qty * price
+                    positions[ticker] = positions.get(ticker, 0) + qty
+
+            elif direction == 'SELL':
+                held = positions.get(ticker, 0)
+                qty = min(int(size), held)
+                if qty > 0:
+                    new_held = held - qty
+                    if new_held > 0:
+                        positions[ticker] = new_held
+                    else:
+                        positions.pop(ticker, None)
+                    cash += qty * price
+        except Exception:
+            # never let one bad order break bookkeeping
+            continue
+
+    _state['cash'] = cash
+    _state['pending_orders'] = []
+
+
+def _compute_rebalance_orders(history, ts_col, close_prices):
+    """Compute target portfolio and translate it into BUY/SELL orders."""
+    try:
+        lookback = max(_state['lookback_mom'], _state['lookback_vol']) + 1
+        timestamps = _state['timestamps']
+        if len(timestamps) < lookback:
+            return []
+
+        cutoff_ts = timestamps[-lookback]
+        start_idx = np.searchsorted(ts_col, cutoff_ts, side='left')
+        window = history.iloc[start_idx:]
+
+        pivot = window.pivot_table(index='timestamp', columns='ticker',
+                                    values='close', aggfunc='last')
+        pivot = pivot.sort_index()
+        if pivot.shape[0] < 2:
+            return []
+
+        mom_window = pivot.tail(_state['lookback_mom'] + 1)
+        vol_window = pivot.tail(_state['lookback_vol'] + 1)
+
+        first_row = mom_window.iloc[0]
+        last_row = mom_window.iloc[-1]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            momentum = (last_row / first_row) - 1.0
+        momentum = momentum.replace([np.inf, -np.inf], np.nan)
+
+        returns = vol_window.pct_change().iloc[1:]
+        vol = returns.std()
+
+        eligible = [
+            t for t in momentum.dropna().index
+            if t in vol.index and pd.notna(vol.get(t)) and vol.get(t) > 1e-6
+            and t in close_prices and close_prices[t] is not None
+            and np.isfinite(close_prices[t]) and close_prices[t] > 0
+        ]
+
+        target_shares = {}
+        if eligible:
+            mom_series = momentum.loc[eligible]
+            positive = mom_series[mom_series > 0].sort_values(ascending=False)
+            selected = list(positive.index[:_state['top_n']])
+
+            if selected:
+                inv_vol = 1.0 / vol.loc[selected]
+                weights = inv_vol / inv_vol.sum()
+
+                positions = _state['positions']
+                portfolio_value = _state['cash'] + sum(
+                    positions.get(t, 0) * close_prices.get(t, 0.0)
+                    for t in positions
+                )
+                invest_total = portfolio_value * _state['invest_fraction']
+
+                for t in selected:
+                    price = close_prices.get(t)
+                    if price is None or price <= 0:
+                        continue
+                    target_value = weights.loc[t] * invest_total
+                    shares = int(target_value // price)
+                    if shares > 0:
+                        target_shares[t] = shares
+
+        # ---- translate target vs current simulated holdings into orders ----
+        positions = _state['positions']
+        held_tickers = set(positions.keys())
+        target_tickers = set(target_shares.keys())
+
+        sell_orders = []
+        buy_orders = []
+
+        for t in held_tickers - target_tickers:
+            qty = positions.get(t, 0)
+            if qty > 0:
+                sell_orders.append([t, 'SELL', qty])
+
+        for t in target_tickers:
+            current_qty = positions.get(t, 0)
+            target_qty = target_shares[t]
+            diff = target_qty - current_qty
+            if diff > 0:
+                buy_orders.append([t, 'BUY', diff])
+            elif diff < 0:
+                sell_orders.append([t, 'SELL', -diff])
+
+        total_buy_cost = sum(
+            qty * close_prices.get(t, 0.0) for t, _, qty in buy_orders
+        )
+        available_cash = _state['cash'] * _state['cash_buffer']
+        if total_buy_cost > available_cash and total_buy_cost > 0:
+            scale = available_cash / total_buy_cost
+            for order in buy_orders:
+                order[2] = int(order[2] * scale)
+
+        final_orders = [tuple(o) for o in buy_orders if o[2] > 0]
+        final_orders += [tuple(o) for o in sell_orders if o[2] > 0]
+        return final_orders
+
+    except Exception:
+        return []
+
+
+def on_bar(history):
+    """Called once per time step, in chronological order."""
+    try:
+        last_ts = history['timestamp'].iloc[-1]
+
+        timestamps = _state['timestamps']
+        if not timestamps or timestamps[-1] != last_ts:
+            timestamps.append(last_ts)
+        _state['bar_count'] += 1
+
+        ts_col = history['timestamp'].to_numpy()
+        start_idx = np.searchsorted(ts_col, last_ts, side='left')
+        current_rows = history.iloc[start_idx:]
+
+        open_prices = dict(zip(current_rows['ticker'], current_rows['open']))
+        close_prices = dict(zip(current_rows['ticker'], current_rows['close']))
+
+        # 1. settle orders submitted on the previous bar, at today's open
+        if _state['pending_orders']:
+            _process_pending_orders(open_prices)
+
+        # 2. periodically recompute target portfolio and emit new orders
+        orders = []
+        bar_count = _state['bar_count']
+        enough_history = len(timestamps) >= _state['min_history']
+        due = (bar_count - _state['last_rebalance_bar']) >= _state['rebalance_period']
+
+        if enough_history and due:
+            orders = _compute_rebalance_orders(history, ts_col, close_prices)
+            _state['pending_orders'] = orders
+            _state['last_rebalance_bar'] = bar_count
+
+        return orders
+
+    except Exception:
+        # Never let an unexpected error crash the run.
+        return []

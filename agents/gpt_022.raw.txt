@@ -1,0 +1,391 @@
+Below is a self-contained module implementing a long-only, cross-sectional momentum strategy.
+
+Design summary:
+
+- Maintains its own cash and position estimate by replaying its prior orders at the next observed open.
+- Uses only information available through the current bar.
+- Rebalances every 21 bars after sufficient history exists.
+- Ranks stocks by medium-term and short-term momentum, penalized by volatility.
+- Avoids weak overall markets by moving to cash when median universe momentum is substantially negative.
+- Holds up to 12 liquid, positive-momentum tickers equally weighted.
+- Sells first, then buys on later bars after sale proceeds are known.
+- Uses conservative buy sizing so overnight gaps are less likely to cause unexpectedly large partial fills.
+- Never shorts, borrows, or intentionally submits more sell shares than it estimates it owns.
+
+```python
+import math
+from collections import defaultdict, deque
+
+import numpy as np
+
+
+# ---------- Configuration ----------
+
+LOOKBACK_LONG = 60
+LOOKBACK_SHORT = 20
+VOL_LOOKBACK = 20
+VOLUME_LOOKBACK = 20
+
+REBALANCE_EVERY = 21
+MAX_HOLDINGS = 12
+
+# Keep a cash reserve and allow room for next-open price gaps.
+TARGET_INVESTED_FRACTION = 0.90
+BUY_SAFETY_FACTOR = 0.98
+
+# If broad cross-sectional momentum is sufficiently poor, hold cash.
+MARKET_RISK_OFF_THRESHOLD = -0.06
+
+# Need enough observations to calculate the signal.
+MIN_HISTORY = LOOKBACK_LONG + 1
+
+
+# ---------- Persistent module state ----------
+
+_cash = 0.0
+_positions = {}
+_pending_orders = []
+
+_last_history_length = 0
+_bar_number = 0
+
+_close_history = defaultdict(lambda: deque(maxlen=MIN_HISTORY + 5))
+_volume_history = defaultdict(lambda: deque(maxlen=VOLUME_LOOKBACK + 5))
+_last_close = {}
+
+# Desired dollar allocation by ticker, set at rebalance time.
+_target_values = {}
+
+
+def init(cash):
+    """
+    Initialize strategy state. Called once by the platform before the first bar.
+    """
+    global _cash, _positions, _pending_orders
+    global _last_history_length, _bar_number
+    global _close_history, _volume_history, _last_close, _target_values
+
+    _cash = float(cash)
+    _positions = {}
+    _pending_orders = []
+
+    _last_history_length = 0
+    _bar_number = 0
+
+    _close_history = defaultdict(lambda: deque(maxlen=MIN_HISTORY + 5))
+    _volume_history = defaultdict(lambda: deque(maxlen=VOLUME_LOOKBACK + 5))
+    _last_close = {}
+
+    _target_values = {}
+
+
+def _valid_price(value):
+    try:
+        value = float(value)
+        return np.isfinite(value) and value > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _process_pending_orders(current_rows):
+    """
+    Reconstruct fills for orders submitted on the preceding bar.
+
+    Orders execute at this bar's open. We do not receive broker reports, so
+    this local accounting mirrors the platform's stated fill rules.
+    """
+    global _cash, _positions, _pending_orders
+
+    if not _pending_orders:
+        return
+
+    open_prices = {}
+
+    for row in current_rows.itertuples(index=False):
+        ticker = row.ticker
+        price = row.open
+        if _valid_price(price):
+            open_prices[ticker] = float(price)
+
+    for ticker, direction, requested_size in _pending_orders:
+        price = open_prices.get(ticker)
+
+        # No bar / no valid open for this ticker means no fill.
+        if price is None:
+            continue
+
+        if direction == "SELL":
+            available = int(_positions.get(ticker, 0))
+            filled = min(int(requested_size), available)
+
+            if filled > 0:
+                _positions[ticker] = available - filled
+                if _positions[ticker] <= 0:
+                    _positions.pop(ticker, None)
+                _cash += filled * price
+
+        elif direction == "BUY":
+            affordable = int(math.floor(_cash / price))
+            filled = min(int(requested_size), affordable)
+
+            if filled > 0:
+                _positions[ticker] = int(_positions.get(ticker, 0)) + filled
+                _cash -= filled * price
+
+    _pending_orders = []
+
+
+def _update_market_data(current_rows):
+    """
+    Add the current bar's close and volume observations to rolling histories.
+    """
+    for row in current_rows.itertuples(index=False):
+        ticker = row.ticker
+
+        close = row.close
+        if _valid_price(close):
+            close = float(close)
+            _close_history[ticker].append(close)
+            _last_close[ticker] = close
+
+        try:
+            volume = float(row.volume)
+            if not np.isfinite(volume) or volume < 0:
+                volume = 0.0
+        except (TypeError, ValueError):
+            volume = 0.0
+
+        _volume_history[ticker].append(volume)
+
+
+def _portfolio_value():
+    """
+    Estimate account equity using latest available close prices.
+    """
+    total = _cash
+
+    for ticker, shares in _positions.items():
+        price = _last_close.get(ticker)
+        if price is not None and _valid_price(price):
+            total += int(shares) * float(price)
+
+    return total
+
+
+def _build_targets():
+    """
+    Select the desired portfolio from cross-sectional momentum scores.
+
+    Score components:
+      - 60-bar momentum
+      - 20-bar momentum
+      - penalty for recent realized volatility
+      - liquidity filtering using trailing dollar volume
+    """
+    global _target_values
+
+    candidates = []
+
+    for ticker, closes_deque in _close_history.items():
+        if len(closes_deque) < MIN_HISTORY:
+            continue
+
+        closes = np.asarray(closes_deque, dtype=float)
+        if not np.all(np.isfinite(closes)) or np.any(closes <= 0):
+            continue
+
+        current_price = closes[-1]
+        long_ago = closes[-1 - LOOKBACK_LONG]
+        short_ago = closes[-1 - LOOKBACK_SHORT]
+
+        if long_ago <= 0 or short_ago <= 0:
+            continue
+
+        long_return = current_price / long_ago - 1.0
+        short_return = current_price / short_ago - 1.0
+
+        recent = closes[-(VOL_LOOKBACK + 1):]
+        log_returns = np.diff(np.log(recent))
+
+        if len(log_returns) < 5:
+            continue
+
+        realized_vol = float(np.std(log_returns, ddof=1) * math.sqrt(VOL_LOOKBACK))
+
+        volumes = _volume_history.get(ticker)
+        if volumes is not None and len(volumes) > 0:
+            avg_volume = float(np.mean(volumes))
+        else:
+            avg_volume = 0.0
+
+        dollar_volume = current_price * max(avg_volume, 0.0)
+
+        # Favor trend persistence while penalizing unstable names.
+        score = (
+            0.70 * long_return
+            + 0.30 * short_return
+            - 0.35 * realized_vol
+        )
+
+        candidates.append(
+            {
+                "ticker": ticker,
+                "long_return": long_return,
+                "score": score,
+                "dollar_volume": dollar_volume,
+            }
+        )
+
+    if not candidates:
+        _target_values = {}
+        return
+
+    # Broad market condition based on median long-horizon return.
+    broad_momentum = float(np.median([x["long_return"] for x in candidates]))
+
+    if broad_momentum < MARKET_RISK_OFF_THRESHOLD:
+        _target_values = {}
+        return
+
+    # Require non-negative medium-term momentum for new holdings.
+    candidates = [x for x in candidates if x["long_return"] > 0.0]
+
+    if not candidates:
+        _target_values = {}
+        return
+
+    # Exclude the least liquid portion of the universe.
+    liquidities = np.asarray([x["dollar_volume"] for x in candidates], dtype=float)
+    liquidity_cutoff = float(np.percentile(liquidities, 30))
+
+    liquid_candidates = [
+        x for x in candidates
+        if x["dollar_volume"] >= liquidity_cutoff
+    ]
+
+    if not liquid_candidates:
+        _target_values = {}
+        return
+
+    liquid_candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    selected = liquid_candidates[:min(MAX_HOLDINGS, len(liquid_candidates))]
+
+    if not selected:
+        _target_values = {}
+        return
+
+    equity = _portfolio_value()
+    investable = max(0.0, equity * TARGET_INVESTED_FRACTION)
+    allocation = investable / len(selected)
+
+    _target_values = {
+        item["ticker"]: allocation
+        for item in selected
+    }
+
+
+def _make_rebalance_orders():
+    """
+    Build orders needed to move toward current targets.
+
+    The strategy deliberately submits sells separately from buys. This avoids
+    relying on broker-specific order sequencing when sell proceeds and buy
+    orders would otherwise occur on the same next-bar open.
+    """
+    orders = []
+
+    # First phase: sell names that are no longer desired or are oversized.
+    sell_orders = []
+
+    for ticker, shares in list(_positions.items()):
+        shares = int(shares)
+        if shares <= 0:
+            continue
+
+        price = _last_close.get(ticker)
+        if price is None or not _valid_price(price):
+            continue
+
+        target_value = float(_target_values.get(ticker, 0.0))
+        desired_shares = int(math.floor(target_value / price))
+
+        if shares > desired_shares:
+            quantity = shares - desired_shares
+            if quantity > 0:
+                sell_orders.append((ticker, "SELL", quantity))
+
+    if sell_orders:
+        return sell_orders
+
+    # Second phase: buy underweight desired positions.
+    # Only performed when there are no sell orders needed.
+    buy_needs = []
+    total_needed = 0.0
+
+    for ticker, target_value in _target_values.items():
+        price = _last_close.get(ticker)
+        if price is None or not _valid_price(price):
+            continue
+
+        current_shares = int(_positions.get(ticker, 0))
+        current_value = current_shares * price
+        needed_value = max(0.0, float(target_value) - current_value)
+
+        if needed_value >= price:
+            buy_needs.append((ticker, price, needed_value))
+            total_needed += needed_value
+
+    if total_needed <= 0.0 or _cash <= 0.0:
+        return []
+
+    # Reserve some cash because execution occurs at the next open, not close.
+    available_budget = max(0.0, _cash * TARGET_INVESTED_FRACTION)
+    scale = min(1.0, available_budget / total_needed)
+
+    for ticker, price, needed_value in buy_needs:
+        intended_dollars = needed_value * scale * BUY_SAFETY_FACTOR
+        quantity = int(math.floor(intended_dollars / price))
+
+        if quantity > 0:
+            orders.append((ticker, "BUY", quantity))
+
+    return orders
+
+
+def on_bar(history):
+    """
+    Called once per timestamp. Returns a list of:
+        (ticker, "BUY" or "SELL", positive_integer_share_count)
+    """
+    global _last_history_length, _bar_number, _pending_orders
+
+    # New rows since the prior call correspond to the current timestamp.
+    current_rows = history.iloc[_last_history_length:]
+    _last_history_length = len(history)
+
+    if len(current_rows) == 0:
+        return []
+
+    # Prior orders fill at this timestamp's open.
+    _process_pending_orders(current_rows)
+
+    # Current closing information is now available for signal generation.
+    _update_market_data(current_rows)
+    _bar_number += 1
+
+    orders = []
+
+    # Recompute cross-sectional targets periodically.
+    if _bar_number >= MIN_HISTORY and (_bar_number % REBALANCE_EVERY == 0):
+        _build_targets()
+        orders = _make_rebalance_orders()
+
+    # Between rebalance dates, continue completing staged transitions.
+    # For example, this buys after prior-bar sell proceeds have been observed.
+    elif _target_values:
+        orders = _make_rebalance_orders()
+
+    _pending_orders = list(orders)
+    return orders
+```

@@ -1,0 +1,1609 @@
+
+========================================================================
+REPORT -- all -- 2026-08-15 18:59
+========================================================================
+loading tape and reconstructing positions...
+  agent_001
+  agent_002
+  agent_003
+  agent_004
+  agent_005
+  agent_006
+  agent_007
+  agent_008
+  agent_009
+  agent_010
+  agent_011
+  agent_012
+  agent_013
+  agent_014
+  agent_015
+  agent_016
+  agent_017
+  agent_018
+  agent_019
+  agent_020
+  agent_021
+  agent_022
+  agent_023
+  agent_024
+  agent_025
+  agent_026
+  agent_027
+  agent_028
+  agent_029
+  agent_030
+  gemini_001
+  gemini_002
+  gemini_003
+  gemini_004
+  gemini_005
+  gemini_006
+  gemini_007
+  gemini_008
+  gemini_009
+  gemini_010
+  gemini_011
+  gemini_012
+  gemini_013
+  gemini_014
+  gemini_015
+  gemini_016
+  gemini_017
+  gemini_018
+  gemini_019
+  gemini_020
+  gemini_021
+  gemini_022
+  gemini_023
+  gemini_024
+  gemini_025
+  gemini_026
+  gemini_027
+  gemini_028
+  gemini_029
+  gemini_030
+  gpt_001
+  gpt_002
+  gpt_003
+  gpt_004
+  gpt_005
+  gpt_006
+  gpt_007
+  gpt_008
+  gpt_009
+  gpt_010
+  gpt_011
+  gpt_012
+  gpt_013
+  gpt_014
+  gpt_015
+  gpt_016
+  gpt_017
+  gpt_018
+  gpt_019
+  gpt_020
+  gpt_021
+  gpt_022
+  gpt_023
+  gpt_024
+  gpt_025
+  gpt_026
+  gpt_027
+  gpt_028
+  gpt_029
+  gpt_030
+
+90 agents | 3,250 scored bars | 486 tickers
+models: claude 30, gemini 30, gpt 30
+
+========================================================================
+PAIRWISE HOLDINGS OVERLAP
+========================================================================
+computing per-bar pair matrices (this is the slow part)
+  bars 250/3,250
+  bars 500/3,250
+  bars 750/3,250
+  bars 1,000/3,250
+  bars 1,250/3,250
+  bars 1,500/3,250
+  bars 1,750/3,250
+  bars 2,000/3,250
+  bars 2,250/3,250
+  bars 2,500/3,250
+  bars 2,750/3,250
+  bars 3,000/3,250
+  bars 3,250/3,250
+
+excluded from overlap (held something on <5% of bars): gemini_002, gemini_026, gpt_004
+  inactive rate 3/90 = 3.3%
+  -> csv/pairs_all.csv
+
+========================================================================
+JACCARD DISTRIBUTIONS
+========================================================================
+        group   kind  n_pairs   mean     sd  sd_over_mean    min     q1  median     q3    max  pairs_above_0.5  pairs_above_0.7  pairs_above_0.9
+claude-claude within      435 0.1943 0.2096         1.079 0.0077 0.0547  0.1217 0.2079 0.9965               48               17                8
+claude-gemini  cross      840 0.1170 0.1120         0.957 0.0047 0.0420  0.0829 0.1466 0.9666                6                1                1
+   claude-gpt  cross      870 0.1534 0.1179         0.769 0.0046 0.0590  0.1193 0.2146 0.5738                8                0                0
+gemini-gemini within      378 0.1432 0.1186         0.828 0.0167 0.0651  0.1015 0.1777 0.7380                8                1                0
+   gemini-gpt  cross      812 0.1149 0.0923         0.803 0.0073 0.0554  0.0891 0.1403 0.5765                4                0                0
+      gpt-gpt within      406 0.2264 0.1552         0.686 0.0071 0.1231  0.1898 0.2926 0.8004               30                5                0
+   ALL within within     1219 0.1891 0.1707         0.903 0.0071 0.0704  0.1426 0.2348 0.9965               86               23                8
+    ALL cross  cross     2522 0.1289 0.1097         0.851 0.0046 0.0509  0.0963 0.1658 0.9666               18                1                1
+  -> csv/distribution_jaccard.csv
+
+========================================================================
+COSINE DISTRIBUTIONS
+========================================================================
+        group   kind  n_pairs   mean     sd  sd_over_mean    min     q1  median     q3    max  pairs_above_0.5  pairs_above_0.7  pairs_above_0.9
+claude-claude within      435 0.2565 0.2300         0.897 0.0286 0.0828  0.1643 0.3088 0.9894               83               32                8
+claude-gemini  cross      840 0.1613 0.1373         0.851 0.0072 0.0634  0.1148 0.2078 0.9738               35                6                1
+   claude-gpt  cross      870 0.2502 0.1536         0.614 0.0136 0.1238  0.2127 0.3610 0.6988               65                0                0
+gemini-gemini within      378 0.2066 0.1657         0.802 0.0209 0.0933  0.1469 0.2688 0.8317               34                6                0
+   gemini-gpt  cross      812 0.1712 0.1200         0.701 0.0033 0.0848  0.1448 0.2172 0.6264               26                0                0
+      gpt-gpt within      406 0.3487 0.1853         0.531 0.0153 0.2235  0.3305 0.4688 0.8646               82               19                0
+   ALL within within     1219 0.2717 0.2053         0.756 0.0153 0.1081  0.2185 0.3814 0.9894              199               57                8
+    ALL cross  cross     2522 0.1952 0.1438         0.737 0.0033 0.0870  0.1557 0.2664 0.9738              126                6                1
+  -> csv/distribution_cosine.csv
+
+========================================================================
+MODEL MATRIX (mean jaccard)
+========================================================================
+        claude  gemini     gpt
+claude  0.1943  0.1170  0.1534
+gemini  0.1170  0.1432  0.1149
+gpt     0.1534  0.1149  0.2264
+
+diagonal = within-model, off-diagonal = between two models
+  -> csv/model_matrix.csv
+
+========================================================================
+CONVERGENCE RATIO (within / cross)
+========================================================================
+how much more a model's agents resemble each other than outsiders
+1.0 = no self-similarity at all;  higher = more monocultural
+
+  claude   within 0.1943  cross 0.1355  ratio 1.434
+  gemini   within 0.1432  cross 0.1160  ratio 1.235
+  gpt      within 0.2264  cross 0.1348  ratio 1.679
+  -> csv/convergence_ratio.csv
+
+========================================================================
+CROSS-MODEL NEAR-DUPLICATES (jaccard > 0.7)
+========================================================================
+a high-scoring pair spanning two models means the strategy space
+itself has an attractor, not that one model has a house style
+
+        a          b  jaccard   cosine
+agent_028 gemini_011 0.966594 0.973792
+  -> csv/cross_model_near_duplicates.csv
+
+========================================================================
+PERMUTATION NULL -- jaccard (5,000 shuffles)
+========================================================================
+  claude   observed 0.1943  null 0.1484  gate 0.1778  p 0.00720  z  2.71  PASS
+  gemini   observed 0.1432  null 0.1487  gate 0.1780  p 0.60968  z -0.32  fail
+  gpt      observed 0.2264  null 0.1489  gate 0.1783  p 0.00020  z  4.57  PASS
+  POOLED   observed 0.1891  null 0.1485  gate 0.1534  p 0.00020  z 15.14  PASS
+  -> csv/null_jaccard.csv
+
+========================================================================
+PERMUTATION NULL -- cosine (5,000 shuffles)
+========================================================================
+  claude   observed 0.2565  null 0.2202  gate 0.2566  p 0.05059  z  1.69  fail
+  gemini   observed 0.2066  null 0.2202  gate 0.2568  p 0.73225  z -0.65  fail
+  gpt      observed 0.3487  null 0.2203  gate 0.2567  p 0.00020  z  6.05  PASS
+  POOLED   observed 0.2717  null 0.2200  gate 0.2262  p 0.00020  z 15.53  PASS
+  -> csv/null_cosine.csv
+
+========================================================================
+PER-AGENT TYPICALITY
+========================================================================
+each agent's mean overlap with the others from its own model
+high = a central, representative agent;  low = an outlier
+
+  claude   range 0.041 - 0.295   most typical agent_016   least agent_027
+  gemini   range 0.054 - 0.234   most typical gemini_030   least gemini_016
+  gpt      range 0.020 - 0.305   most typical gpt_027   least gpt_011
+  -> csv/agent_typicality.csv
+
+========================================================================
+HOLDINGS CLUSTERS
+========================================================================
+  at similarity >= 0.3: 9 clusters covering 65 agents, largest 19, 22 singletons
+  at similarity >= 0.4: 9 clusters covering 56 agents, largest 10, 31 singletons
+  at similarity >= 0.5: 11 clusters covering 47 agents, largest 9, 40 singletons
+  at similarity >= 0.6: 9 clusters covering 32 agents, largest 7, 55 singletons
+  -> csv/cluster_counts.csv
+
+membership at similarity >= 0.3 (9 multi-agent clusters):
+  cluster 12: 19 agents  [claude 7, gemini 2, gpt 10]  agent_005 agent_006 agent_007 agent_010 agent_024 agent_026 agent_030 gemini_013 gemini_022 gpt_007 gpt_009 gpt_013 gpt_014 gpt_015 gpt_017 gpt_021 gpt_022 gpt_023 gpt_027
+  cluster 11: 11 agents  [claude 9, gemini 2]  agent_002 agent_008 agent_015 agent_016 agent_018 agent_019 agent_022 agent_025 agent_029 gemini_005 gemini_008
+  cluster 19: 11 agents  [claude 3, gemini 8]  agent_009 agent_011 agent_028 gemini_001 gemini_004 gemini_011 gemini_019 gemini_020 gemini_023 gemini_025 gemini_030
+  cluster 8: 10 agents  [gemini 2, gpt 8]  gemini_006 gemini_018 gpt_001 gpt_003 gpt_005 gpt_010 gpt_012 gpt_019 gpt_026 gpt_030
+  cluster 9: 6 agents  [claude 5, gemini 1]  agent_004 agent_012 agent_014 agent_020 agent_021 gemini_009
+  cluster 5: 2 agents  [claude 1, gemini 1]  agent_001 gemini_010
+  cluster 10: 2 agents  [gpt 2]  gpt_002 gpt_028
+  cluster 6: 2 agents  [gpt 2]  gpt_016 gpt_029
+  cluster 7: 2 agents  [gpt 2]  gpt_018 gpt_020
+  -> csv/cluster_membership.csv
+
+cluster x model (multi-agent clusters only)
+model    claude  gemini  gpt
+cluster                     
+5             1       1    0
+6             0       0    2
+7             0       0    2
+8             0       2    8
+9             5       1    0
+10            0       0    2
+11            9       2    0
+12            7       2   10
+19            3       8    0
+
+3 of 9 clusters contain agents from only one model
+  -> csv/cluster_by_model.csv
+  -> figures/dendrogram.png
+  -> figures/null_test.png
+  -> figures/overlap_distribution.png
+  -> figures/model_matrix.png
+  -> figures/agent_typicality.png
+
+========================================================================
+POPULATION SIGNED FLOW
+========================================================================
+directional imbalance = |net shares| / gross shares, per ticker per bar
+1.0 = every agent traded the same way, nothing cancels
+0.0 = perfectly offsetting, no net effect on the market
+
+This is the measure closest to a crash: agents holding the same
+portfolio forever move no prices, agents selling together do.
+
+  ALL      observed 0.7252   (whole population; no null --
+           shuffling every agent into one group reproduces it exactly)
+
+  claude   observed 0.8433  null 0.8189  gate 0.8486  p 0.10579  z  1.27  fail
+  gemini   observed 0.7503  null 0.8191  gate 0.8492  p 1.00000  z -3.57  fail
+  gpt      observed 0.8312  null 0.8210  gate 0.8524  p 0.33932  z  0.49  fail
+  -> csv/flow_imbalance.csv
+
+The null mean is a headline in itself: draw agents at random from
+anywhere in the pool and 82% of their trading still fails to cancel.
+
+========================================================================
+FLOW IMBALANCE OVER TIME
+========================================================================
+  claude   mean 0.9235  sd 0.1007  min 0.4422  max 1.0000  bars at 1.0: 595
+  gemini   mean 0.7529  sd 0.0926  min 0.3045  max 0.9800  bars at 1.0: 0
+  gpt      mean 0.9628  sd 0.0836  min 0.3732  max 1.0000  bars at 1.0: 2435
+  -> csv/flow_timeseries.csv
+  -> figures/flow_imbalance.png
+
+========================================================================
+POPULATION CROWDING
+========================================================================
+how piled-up the whole population is, rather than pair by pair
+effective names = distinct stocks the population really spans,
+after duplicate holdings are discounted
+
+  claude   top1 0.706 (peak 0.967)  top5 0.235  effective names 45.7 (min 23.2)
+  gemini   top1 0.601 (peak 0.964)  top5 0.309  effective names 30.9 (min 13.9)
+  gpt      top1 0.737 (peak 0.966)  top5 0.423  effective names 18.6 (min 6.7)
+  ALL      top1 0.585 (peak 0.908)  top5 0.264  effective names 39.6 (min 18.3)
+  -> csv/crowding.csv
+  -> csv/crowding_timeseries.csv
+
+========================================================================
+MOST-CROWDED TICKERS
+========================================================================
+ranked by total agent-bars held
+
+  claude   MU, STX, WDC, ANET, ALB, WBD, MRNA, INTC, DG, CEG
+  gemini   JBL, NRG, TPR, STX, NEM, MU, DG, CTRA, FICO, RCL
+  gpt      MU, STX, LLY, AMD, ANET, NEM, WDC, NVDA, WBD, INTC
+  ALL      MU, STX, WDC, ANET, NEM, WBD, DG, INTC, MRNA, ALB
+
+  in every model's top ten: MU, STX
+  (heavy overlap means one universal attractor;
+   disjoint lists mean separate monocultures per model)
+  -> csv/top_tickers.csv
+  -> figures/crowding_over_time.png
+
+========================================================================
+STRATEGY CLASSIFICATION
+========================================================================
+two independent views: how each agent traded, and what its code says.
+neither is authoritative -- the keyword scan counts words, and any
+behavioural label depends on where the boundaries are drawn.
+
+BEHAVIOURAL SPREAD PER MODEL
+       mean_names_held         median_hold_bars          orders_per_bar        flat_frac        tickers_ever_held          concentration_hhi       
+                  mean     std             mean      std           mean    std      mean    std              mean      std              mean    std
+model                                                                                                                                              
+claude          11.773  10.678           11.833    8.526          1.820  0.795     0.025  0.136           372.867   74.501             0.126  0.031
+gemini           6.910   3.278            2.500    2.177          5.988  4.002     0.072  0.254           424.633  124.811             0.162  0.067
+gpt              6.360   2.175          115.633  591.999          1.438  0.643     0.066  0.197           354.867  123.186             0.181  0.162
+  -> csv/behavioural_spread.csv
+
+========================================================================
+BEHAVIOUR CLUSTERS x MODEL
+========================================================================
+clusters found in the behaviour numbers themselves, not by cutoffs
+
+model              claude  gemini  gpt
+behaviour_cluster                     
+1                       0       2    1
+2                       0      21    0
+3                      30       7   28
+4                       0       0    1
+  -> csv/behaviour_clusters.csv
+
+cluster profiles (median):
+                   mean_names_held  median_hold_bars  orders_per_bar  flat_frac  tickers_ever_held  concentration_hhi
+behaviour_cluster                                                                                                    
+1                              0.0               0.0            0.00        1.0                0.0               0.00
+2                              6.0               2.0            6.17        0.0              484.0               0.17
+3                              8.0              10.0            1.61        0.0              383.0               0.13
+4                              1.0              10.0            0.25        0.0              123.0               1.00
+
+========================================================================
+SOURCE-KEYWORD FAMILY x MODEL
+========================================================================
+crude: counts word occurrences in the generated code
+
+model           claude  gemini  gpt
+source_family                      
+mean_reversion       0       3    0
+momentum            27       9   11
+trend                3      13   17
+volatility           0       5    2
+  -> csv/strategy_per_agent.csv
+
+========================================================================
+HOLDINGS CLUSTER x BEHAVIOUR CLUSTER
+========================================================================
+agents grouped by holdings but NOT by behaviour are running the
+same strategy and landing on the same names. grouped by both
+means genuinely distinct strategy families.
+
+behaviour_cluster  2   3  4
+cluster                    
+1                  1   0  0
+2                  0   1  0
+3                  0   1  0
+4                  0   1  0
+5                  1   1  0
+6                  0   2  0
+7                  0   2  0
+8                  2   8  0
+9                  0   6  0
+10                 0   2  0
+11                 2   9  0
+12                 1  18  0
+13                 0   1  0
+14                 0   1  0
+15                 0   1  0
+16                 1   0  0
+17                 1   0  0
+18                 1   0  0
+19                 6   5  0
+20                 1   0  0
+21                 1   0  0
+22                 1   0  0
+23                 0   1  0
+24                 1   0  0
+25                 1   0  0
+26                 0   0  1
+27                 0   1  0
+28                 0   1  0
+29                 0   1  0
+30                 0   1  0
+31                 0   1  0
+  -> figures/behaviour_scatter.png
+
+========================================================================
+TIME AND MARKET REGIME
+========================================================================
+every number elsewhere in this report is a yearly average.
+this section splits the year, because an average hides the episodes.
+
+  regime bars: calm 1,079, normal 1,079, stressed 1,092
+  (terciles of 5-day realised volatility of an equal-weighted index)
+
+========================================================================
+OVERLAP BY MARKET REGIME
+========================================================================
+          claude  gemini     gpt   cross
+regime                                  
+calm      0.2022  0.1246  0.2254  0.1272
+normal    0.1870  0.1195  0.2053  0.1145
+stressed  0.1935  0.1304  0.2046  0.1204
+  -> csv/overlap_by_regime.csv
+
+========================================================================
+OVERLAP BY MONTH
+========================================================================
+         claude  gemini     gpt   cross
+month                                  
+2025-01  0.2067  0.1222  0.2062  0.1212
+2025-02  0.2005  0.1237  0.2167  0.1214
+2025-03  0.1827  0.1203  0.1881  0.1080
+2025-04  0.1905  0.1443  0.2075  0.1203
+2025-05  0.1976  0.1266  0.2088  0.1219
+2025-06  0.1956  0.1273  0.2224  0.1260
+2025-07  0.1908  0.1152  0.2059  0.1148
+2025-08  0.1822  0.1202  0.1977  0.1138
+2025-09  0.2222  0.1298  0.2376  0.1403
+2025-10  0.1999  0.1326  0.2265  0.1285
+2025-11  0.1809  0.1196  0.1967  0.1110
+2025-12  0.1818  0.1159  0.2241  0.1202
+  -> csv/overlap_by_month.csv
+  -> csv/overlap_timeseries.csv
+
+========================================================================
+PEAK CROWDING BARS
+========================================================================
+
+  claude: top 10 bars, mean 0.1943, peak 0.3630
+    dates: 2025-04-04, 2025-09-15
+    regimes: {'stressed': 10}
+
+  gemini: top 10 bars, mean 0.1248, peak 0.3117
+    dates: 2025-04-04, 2025-04-21, 2025-05-22
+    regimes: {'stressed': 10}
+
+  gpt: top 10 bars, mean 0.2117, peak 0.3917
+    dates: 2025-04-04, 2025-04-08, 2025-04-09, 2025-10-08
+    regimes: {'stressed': 6, 'calm': 4}
+
+========================================================================
+FLOW IMBALANCE BY MARKET REGIME
+========================================================================
+if agents herd harder under stress, it shows here and nowhere else
+
+          claude  gemini     gpt
+regime                          
+calm      0.9190  0.7553  0.9612
+normal    0.9239  0.7598  0.9645
+stressed  0.9275  0.7437  0.9628
+  -> csv/flow_by_regime.csv
+
+========================================================================
+SIMULTANEOUS RISK-OFF
+========================================================================
+fraction of the population holding nothing at all, per bar
+a spike means many agents went to cash at the same moment
+
+  claude   mean 0.0248  max 0.0333  bars with >50% flat: 0
+  gemini   mean 0.0060  max 0.2500  bars with >50% flat: 0
+  gpt      mean 0.0342  max 0.6207  bars with >50% flat: 5
+  -> csv/flat_fraction_timeseries.csv
+  -> figures/overlap_over_time.png
+
+========================================================================
+RETURNS -- SIDE ANALYSIS, NOT A HEADLINE
+========================================================================
+the contract states zero commission and zero slippage, so these are
+gross by construction. an agent that trades constantly looks far
+better here than it would anywhere real. kept because it is
+interesting, excluded from every conclusion.
+
+        total_return  benchmark_return  excess_vs_benchmark  sharpe  ann_vol  max_drawdown  shares_traded  net_ret_5mils  net_ret_10mils  net_ret_20mils
+model                                                                                                                                                   
+claude        0.1079            0.1077               0.0002  0.1967   0.2041       -0.2325   6.773935e+05         0.0740          0.0402         -0.0276
+gemini        0.1647            0.1077               0.0570  0.4917   0.1825       -0.1877   2.344798e+06         0.0474         -0.0698         -0.3043
+gpt           0.1364            0.1077               0.0287  0.3340   0.1912       -0.2106   6.010073e+05         0.1063          0.0763          0.0162
+
+  40/90 agents lose money at one cent per share traded
+  -> csv/agent_summary.csv
+  -> figures/cost_sensitivity.png
+
+========================================================================
+DONE
+========================================================================
+  report/summary.txt   everything printed above
+  report/csv/          26 tables
+  report/figures/      10 plots
+
+========================================================================
+REPORT -- all -- 2026-08-16 10:42
+========================================================================
+loading tape and reconstructing positions...
+  agent_001
+  agent_002
+  agent_003
+  agent_004
+  agent_005
+  agent_006
+  agent_007
+  agent_008
+  agent_009
+  agent_010
+  agent_011
+  agent_012
+  agent_013
+  agent_014
+  agent_015
+  agent_016
+  agent_017
+  agent_018
+  agent_019
+  agent_020
+  agent_021
+  agent_022
+  agent_023
+  agent_024
+  agent_025
+  agent_026
+  agent_027
+  agent_028
+  agent_029
+  agent_030
+  gemini_001
+  gemini_002
+  gemini_003
+  gemini_004
+  gemini_005
+  gemini_006
+  gemini_007
+  gemini_008
+  gemini_009
+  gemini_010
+  gemini_011
+  gemini_012
+  gemini_013
+  gemini_014
+  gemini_015
+  gemini_016
+  gemini_017
+  gemini_018
+  gemini_019
+  gemini_020
+  gemini_021
+  gemini_022
+  gemini_023
+  gemini_024
+  gemini_025
+  gemini_026
+  gemini_027
+  gemini_028
+  gemini_029
+  gemini_030
+  gpt_001
+  gpt_002
+  gpt_003
+  gpt_004
+  gpt_005
+  gpt_006
+  gpt_007
+  gpt_008
+  gpt_009
+  gpt_010
+  gpt_011
+  gpt_012
+  gpt_013
+  gpt_014
+  gpt_015
+  gpt_016
+  gpt_017
+  gpt_018
+  gpt_019
+  gpt_020
+  gpt_021
+  gpt_022
+  gpt_023
+  gpt_024
+  gpt_025
+  gpt_026
+  gpt_027
+  gpt_028
+  gpt_029
+  gpt_030
+  popular_001
+  popular_002
+  popular_003
+  popular_004
+  popular_005
+  popular_006
+  popular_007
+  popular_008
+  popular_009
+  popular_010
+  popular_011
+  popular_012
+  popular_013
+  popular_014
+  popular_015
+  popular_016
+  popular_017
+  popular_018
+  popular_019
+  popular_020
+  popular_021
+  popular_022
+  popular_023
+  popular_024
+  popular_025
+  popular_026
+  popular_027
+  popular_028
+  popular_029
+  popular_030
+  random_001
+  random_002
+  random_003
+  random_004
+  random_005
+  random_006
+  random_007
+  random_008
+  random_009
+  random_010
+  random_011
+  random_012
+  random_013
+  random_014
+  random_015
+  random_016
+  random_017
+  random_018
+  random_019
+  random_020
+  random_021
+  random_022
+  random_023
+  random_024
+  random_025
+  random_026
+  random_027
+  random_028
+  random_029
+  random_030
+
+150 agents | 3,250 scored bars | 486 tickers
+models: claude 30, gemini 30, gpt 30, popular 30, random 30
+
+========================================================================
+PAIRWISE HOLDINGS OVERLAP
+========================================================================
+computing per-bar pair matrices (this is the slow part)
+  bars 250/3,250
+  bars 500/3,250
+  bars 750/3,250
+  bars 1,000/3,250
+  bars 1,250/3,250
+  bars 1,500/3,250
+  bars 1,750/3,250
+  bars 2,000/3,250
+  bars 2,250/3,250
+  bars 2,500/3,250
+  bars 2,750/3,250
+  bars 3,000/3,250
+  bars 3,250/3,250
+
+excluded from overlap (held something on <5% of bars): gemini_002, gemini_026, gpt_004
+  inactive rate 3/150 = 2.0%
+  -> csv/pairs_all.csv
+
+========================================================================
+JACCARD DISTRIBUTIONS
+========================================================================
+          group   kind  n_pairs   mean     sd  sd_over_mean    min     q1  median     q3    max  pairs_above_0.5  pairs_above_0.7  pairs_above_0.9
+  claude-claude within      435 0.1943 0.2096         1.079 0.0077 0.0547  0.1217 0.2079 0.9965               48               17                8
+  claude-gemini  cross      840 0.1170 0.1120         0.957 0.0047 0.0420  0.0829 0.1466 0.9666                6                1                1
+     claude-gpt  cross      870 0.1534 0.1179         0.769 0.0046 0.0590  0.1193 0.2146 0.5738                8                0                0
+ claude-popular  cross      900 0.0166 0.0066         0.398 0.0024 0.0126  0.0160 0.0194 0.0958                0                0                0
+  claude-random  cross      900 0.0107 0.0042         0.393 0.0014 0.0088  0.0101 0.0118 0.0739                0                0                0
+  gemini-gemini within      378 0.1432 0.1186         0.828 0.0167 0.0651  0.1015 0.1777 0.7380                8                1                0
+     gemini-gpt  cross      812 0.1149 0.0923         0.803 0.0073 0.0554  0.0891 0.1403 0.5765                4                0                0
+ gemini-popular  cross      840 0.0124 0.0046         0.371 0.0052 0.0092  0.0114 0.0143 0.0504                0                0                0
+  gemini-random  cross      840 0.0089 0.0025         0.281 0.0041 0.0071  0.0085 0.0103 0.0256                0                0                0
+        gpt-gpt within      406 0.2264 0.1552         0.686 0.0071 0.1231  0.1898 0.2926 0.8004               30                5                0
+    gpt-popular  cross      870 0.0131 0.0044         0.336 0.0031 0.0103  0.0125 0.0154 0.0385                0                0                0
+     gpt-random  cross      870 0.0082 0.0023         0.280 0.0004 0.0070  0.0082 0.0094 0.0206                0                0                0
+popular-popular within      435 0.0146 0.0062         0.425 0.0056 0.0101  0.0132 0.0172 0.0508                0                0                0
+ popular-random  cross      900 0.0110 0.0054         0.491 0.0039 0.0079  0.0099 0.0126 0.0788                0                0                0
+  random-random within      435 0.0120 0.0052         0.433 0.0049 0.0091  0.0108 0.0130 0.0426                0                0                0
+     ALL within within     2089 0.1159 0.1566         1.351 0.0049 0.0126  0.0486 0.1637 0.9965               86               23                8
+      ALL cross  cross     8642 0.0458 0.0798         1.742 0.0004 0.0092  0.0127 0.0363 0.9666               18                1                1
+  -> csv/distribution_jaccard.csv
+
+========================================================================
+COSINE DISTRIBUTIONS
+========================================================================
+          group   kind  n_pairs   mean     sd  sd_over_mean    min     q1  median     q3    max  pairs_above_0.5  pairs_above_0.7  pairs_above_0.9
+  claude-claude within      435 0.2565 0.2300         0.897 0.0286 0.0828  0.1643 0.3088 0.9894               83               32                8
+  claude-gemini  cross      840 0.1613 0.1373         0.851 0.0072 0.0634  0.1148 0.2078 0.9738               35                6                1
+     claude-gpt  cross      870 0.2502 0.1536         0.614 0.0136 0.1238  0.2127 0.3610 0.6988               65                0                0
+ claude-popular  cross      900 0.0295 0.0123         0.417 0.0110 0.0217  0.0272 0.0331 0.1044                0                0                0
+  claude-random  cross      900 0.0188 0.0069         0.367 0.0067 0.0152  0.0176 0.0203 0.0667                0                0                0
+  gemini-gemini within      378 0.2066 0.1657         0.802 0.0209 0.0933  0.1469 0.2688 0.8317               34                6                0
+     gemini-gpt  cross      812 0.1712 0.1200         0.701 0.0033 0.0848  0.1448 0.2172 0.6264               26                0                0
+ gemini-popular  cross      840 0.0217 0.0095         0.438 0.0075 0.0158  0.0196 0.0247 0.0792                0                0                0
+  gemini-random  cross      840 0.0163 0.0059         0.362 0.0068 0.0132  0.0152 0.0179 0.0510                0                0                0
+        gpt-gpt within      406 0.3487 0.1853         0.531 0.0153 0.2235  0.3305 0.4688 0.8646               82               19                0
+    gpt-popular  cross      870 0.0261 0.0113         0.433 0.0060 0.0192  0.0238 0.0301 0.0960                0                0                0
+     gpt-random  cross      870 0.0165 0.0061         0.370 0.0015 0.0136  0.0156 0.0182 0.0570                0                0                0
+popular-popular within      435 0.0282 0.0146         0.518 0.0086 0.0182  0.0247 0.0326 0.1079                0                0                0
+ popular-random  cross      900 0.0207 0.0116         0.560 0.0069 0.0141  0.0177 0.0230 0.1458                0                0                0
+  random-random within      435 0.0222 0.0109         0.491 0.0083 0.0163  0.0189 0.0234 0.0851                0                0                0
+     ALL within within     2089 0.1691 0.1986         1.174 0.0083 0.0235  0.0753 0.2564 0.9894              199               57                8
+      ALL cross  cross     8642 0.0721 0.1111         1.541 0.0015 0.0165  0.0229 0.0646 0.9738              126                6                1
+  -> csv/distribution_cosine.csv
+
+========================================================================
+MODEL MATRIX (mean jaccard)
+========================================================================
+         claude  gemini     gpt  popular  random
+claude   0.1943  0.1170  0.1534   0.0166  0.0107
+gemini   0.1170  0.1432  0.1149   0.0124  0.0089
+gpt      0.1534  0.1149  0.2264   0.0131  0.0082
+popular  0.0166  0.0124  0.0131   0.0146  0.0110
+random   0.0107  0.0089  0.0082   0.0110  0.0120
+
+diagonal = within-model, off-diagonal = between two models
+  -> csv/model_matrix.csv
+
+========================================================================
+CONVERGENCE RATIO (within / cross)
+========================================================================
+how much more a model's agents resemble each other than outsiders
+1.0 = no self-similarity at all;  higher = more monocultural
+
+  claude   within 0.1943  cross 0.0730  ratio 2.661
+  gemini   within 0.1432  cross 0.0629  ratio 2.278
+  gpt      within 0.2264  cross 0.0717  ratio 3.158
+  popular  within 0.0146  cross 0.0133  ratio 1.098
+  random   within 0.0120  cross 0.0097  ratio 1.235
+  -> csv/convergence_ratio.csv
+
+========================================================================
+CROSS-MODEL NEAR-DUPLICATES (jaccard > 0.7)
+========================================================================
+a high-scoring pair spanning two models means the strategy space
+itself has an attractor, not that one model has a house style
+
+        a          b  jaccard   cosine
+agent_028 gemini_011 0.966594 0.973792
+  -> csv/cross_model_near_duplicates.csv
+
+========================================================================
+PERMUTATION NULL -- jaccard (5,000 shuffles)
+========================================================================
+  claude   observed 0.1943  null 0.0594  gate 0.0876  p 0.00020  z  8.65  PASS
+  gemini   observed 0.1432  null 0.0595  gate 0.0873  p 0.00020  z  5.33  PASS
+  gpt      observed 0.2264  null 0.0596  gate 0.0886  p 0.00020  z 10.36  PASS
+  popular  observed 0.0146  null 0.0595  gate 0.0877  p 1.00000  z -2.84  fail
+  random   observed 0.0120  null 0.0594  gate 0.0875  p 1.00000  z -3.06  fail
+  POOLED   observed 0.1159  null 0.0594  gate 0.0622  p 0.00020  z 35.99  PASS
+  -> csv/null_jaccard.csv
+
+========================================================================
+PERMUTATION NULL -- cosine (5,000 shuffles)
+========================================================================
+  claude   observed 0.2565  null 0.0915  gate 0.1306  p 0.00020  z  7.39  PASS
+  gemini   observed 0.2066  null 0.0910  gate 0.1297  p 0.00020  z  5.26  PASS
+  gpt      observed 0.3487  null 0.0907  gate 0.1293  p 0.00020  z 11.76  PASS
+  popular  observed 0.0282  null 0.0916  gate 0.1310  p 1.00000  z -2.84  fail
+  random   observed 0.0222  null 0.0915  gate 0.1306  p 1.00000  z -3.10  fail
+  POOLED   observed 0.1691  null 0.0910  gate 0.0948  p 0.00020  z 37.76  PASS
+  -> csv/null_cosine.csv
+
+========================================================================
+PER-AGENT TYPICALITY
+========================================================================
+each agent's mean overlap with the others from its own model
+high = a central, representative agent;  low = an outlier
+
+  claude   range 0.041 - 0.295   most typical agent_016   least agent_027
+  gemini   range 0.054 - 0.234   most typical gemini_030   least gemini_016
+  gpt      range 0.020 - 0.305   most typical gpt_027   least gpt_011
+  popular  range 0.009 - 0.025   most typical popular_018   least popular_012
+  random   range 0.007 - 0.019   most typical random_028   least random_012
+  -> csv/agent_typicality.csv
+
+========================================================================
+HOLDINGS CLUSTERS
+========================================================================
+  at similarity >= 0.3: 9 clusters covering 65 agents, largest 19, 82 singletons
+  at similarity >= 0.4: 9 clusters covering 56 agents, largest 10, 91 singletons
+  at similarity >= 0.5: 11 clusters covering 47 agents, largest 9, 100 singletons
+  at similarity >= 0.6: 9 clusters covering 32 agents, largest 7, 115 singletons
+  -> csv/cluster_counts.csv
+
+membership at similarity >= 0.3 (9 multi-agent clusters):
+  cluster 49: 19 agents  [claude 7, gemini 2, gpt 10]  agent_005 agent_006 agent_007 agent_010 agent_024 agent_026 agent_030 gemini_013 gemini_022 gpt_007 gpt_009 gpt_013 gpt_014 gpt_015 gpt_017 gpt_021 gpt_022 gpt_023 gpt_027
+  cluster 48: 11 agents  [claude 9, gemini 2]  agent_002 agent_008 agent_015 agent_016 agent_018 agent_019 agent_022 agent_025 agent_029 gemini_005 gemini_008
+  cluster 56: 11 agents  [claude 3, gemini 8]  agent_009 agent_011 agent_028 gemini_001 gemini_004 gemini_011 gemini_019 gemini_020 gemini_023 gemini_025 gemini_030
+  cluster 45: 10 agents  [gemini 2, gpt 8]  gemini_006 gemini_018 gpt_001 gpt_003 gpt_005 gpt_010 gpt_012 gpt_019 gpt_026 gpt_030
+  cluster 46: 6 agents  [claude 5, gemini 1]  agent_004 agent_012 agent_014 agent_020 agent_021 gemini_009
+  cluster 42: 2 agents  [claude 1, gemini 1]  agent_001 gemini_010
+  cluster 47: 2 agents  [gpt 2]  gpt_002 gpt_028
+  cluster 43: 2 agents  [gpt 2]  gpt_016 gpt_029
+  cluster 44: 2 agents  [gpt 2]  gpt_018 gpt_020
+  -> csv/cluster_membership.csv
+
+cluster x model (multi-agent clusters only)
+model    claude  gemini  gpt
+cluster                     
+42            1       1    0
+43            0       0    2
+44            0       0    2
+45            0       2    8
+46            5       1    0
+47            0       0    2
+48            9       2    0
+49            7       2   10
+56            3       8    0
+
+3 of 9 clusters contain agents from only one model
+  -> csv/cluster_by_model.csv
+  -> figures/dendrogram.png
+  -> figures/null_test.png
+  -> figures/overlap_distribution.png
+  -> figures/model_matrix.png
+  -> figures/agent_typicality.png
+
+========================================================================
+POPULATION SIGNED FLOW
+========================================================================
+directional imbalance = |net shares| / gross shares, per ticker per bar
+1.0 = every agent traded the same way, nothing cancels
+0.0 = perfectly offsetting, no net effect on the market
+
+This is the measure closest to a crash: agents holding the same
+portfolio forever move no prices, agents selling together do.
+
+  ALL      observed 0.6632   (whole population; no null --
+           shuffling every agent into one group reproduces it exactly)
+
+  claude   observed 0.8433  null 0.8695  gate 0.8926  p 0.92814  z -1.64  fail
+  gemini   observed 0.7503  null 0.8689  gate 0.8930  p 1.00000  z -7.50  fail
+  gpt      observed 0.8312  null 0.8691  gate 0.8939  p 0.98802  z -2.38  fail
+  popular  observed 0.7837  null 0.8687  gate 0.8915  p 1.00000  z -5.62  fail
+  random   observed 0.8276  null 0.8701  gate 0.8944  p 0.99601  z -2.69  fail
+  -> csv/flow_imbalance.csv
+
+The null mean is a headline in itself: draw agents at random from
+anywhere in the pool and 87% of their trading still fails to cancel.
+
+========================================================================
+FLOW IMBALANCE OVER TIME
+========================================================================
+  claude   mean 0.9235  sd 0.1007  min 0.4422  max 1.0000  bars at 1.0: 595
+  gemini   mean 0.7529  sd 0.0926  min 0.3045  max 0.9800  bars at 1.0: 0
+  gpt      mean 0.9628  sd 0.0836  min 0.3732  max 1.0000  bars at 1.0: 2435
+  popular  mean 0.8485  sd 0.1076  min 0.5483  max 1.0000  bars at 1.0: 342
+  random   mean 0.9165  sd 0.0974  min 0.5978  max 1.0000  bars at 1.0: 1301
+  -> csv/flow_timeseries.csv
+  -> figures/flow_imbalance.png
+
+========================================================================
+POPULATION CROWDING
+========================================================================
+how piled-up the whole population is, rather than pair by pair
+effective names = distinct stocks the population really spans,
+after duplicate holdings are discounted
+
+  claude   top1 0.706 (peak 0.967)  top5 0.235  effective names 45.7 (min 23.2)
+  gemini   top1 0.601 (peak 0.964)  top5 0.309  effective names 30.9 (min 13.9)
+  gpt      top1 0.737 (peak 0.966)  top5 0.423  effective names 18.6 (min 6.7)
+  popular  top1 0.180 (peak 0.333)  top5 0.064  effective names 180.3 (min 132.9)
+  random   top1 0.150 (peak 0.267)  top5 0.051  effective names 215.6 (min 184.5)
+  ALL      top1 0.362 (peak 0.558)  top5 0.141  effective names 115.5 (min 31.8)
+  -> csv/crowding.csv
+  -> csv/crowding_timeseries.csv
+
+========================================================================
+MOST-CROWDED TICKERS
+========================================================================
+ranked by total agent-bars held
+
+  claude   MU, STX, WDC, ANET, ALB, WBD, MRNA, INTC, DG, CEG
+  gemini   JBL, NRG, TPR, STX, NEM, MU, DG, CTRA, FICO, RCL
+  gpt      MU, STX, LLY, AMD, ANET, NEM, WDC, NVDA, WBD, INTC
+  popular  MU, WDC, STX, NEM, WBD, MRNA, INTC, ALB, ETSY, NRG
+  random   SRE, BKNG, VMC, SWKS, PTC, CSGP, PSX, ALLE, PPG, INCY
+  ALL      MU, STX, WDC, NEM, WBD, MRNA, ANET, INTC, DG, ALB
+
+  in every model's top ten: none
+  (heavy overlap means one universal attractor;
+   disjoint lists mean separate monocultures per model)
+  -> csv/top_tickers.csv
+  -> figures/crowding_over_time.png
+
+========================================================================
+STRATEGY CLASSIFICATION
+========================================================================
+two independent views: how each agent traded, and what its code says.
+neither is authoritative -- the keyword scan counts words, and any
+behavioural label depends on where the boundaries are drawn.
+
+BEHAVIOURAL SPREAD PER MODEL
+        mean_names_held         median_hold_bars          orders_per_bar        flat_frac        tickers_ever_held          concentration_hhi       
+                   mean     std             mean      std           mean    std      mean    std              mean      std              mean    std
+model                                                                                                                                               
+claude           11.773  10.678           11.833    8.526          1.820  0.795     0.025  0.136           372.867   74.501             0.126  0.031
+gemini            6.910   3.278            2.500    2.177          5.988  4.002     0.072  0.254           424.633  124.811             0.162  0.067
+gpt               6.360   2.175          115.633  591.999          1.438  0.643     0.066  0.197           354.867  123.186             0.181  0.162
+popular          11.740  11.430            5.433    4.890          7.055  6.887     0.000  0.000           467.233   31.911             0.132  0.063
+random           12.513  10.867            7.633    8.071          4.929  3.815     0.000  0.000           481.567   11.878             0.108  0.038
+  -> csv/behavioural_spread.csv
+
+========================================================================
+BEHAVIOUR CLUSTERS x MODEL
+========================================================================
+clusters found in the behaviour numbers themselves, not by cutoffs
+
+model              claude  gemini  gpt  popular  random
+behaviour_cluster                                      
+1                       0       2    1        0       0
+2                       0       9    0       11       8
+3                       0       0    2        0       0
+4                      30      19   27       19      22
+  -> csv/behaviour_clusters.csv
+
+cluster profiles (median):
+                   mean_names_held  median_hold_bars  orders_per_bar  flat_frac  tickers_ever_held  concentration_hhi
+behaviour_cluster                                                                                                    
+1                              0.0               0.0            0.00        1.0                0.0               0.00
+2                             10.0               2.0           10.35        0.0              486.0               0.11
+3                              4.5            1630.0            0.12        0.0               65.5               0.58
+4                              8.0               5.0            2.00        0.0              446.0               0.13
+
+========================================================================
+SOURCE-KEYWORD FAMILY x MODEL
+========================================================================
+crude: counts word occurrences in the generated code
+
+model           claude  gemini  gpt  popular  random
+source_family                                       
+mean_reversion       0       3    0        0       0
+momentum            27       9   11        0       0
+trend                3      13   17        0       0
+unlabelled           0       0    0       30      30
+volatility           0       5    2        0       0
+
+  source not found for 60 agents (expected agents/<name>.py)
+  -> csv/strategy_per_agent.csv
+
+========================================================================
+HOLDINGS CLUSTER x BEHAVIOUR CLUSTER
+========================================================================
+agents grouped by holdings but NOT by behaviour are running the
+same strategy and landing on the same names. grouped by both
+means genuinely distinct strategy families.
+
+behaviour_cluster  2  3   4
+cluster                    
+1                  0  0   1
+2                  0  0   1
+3                  0  0   1
+4                  0  0   1
+5                  0  0   1
+6                  0  0   1
+7                  0  0   1
+8                  0  0   1
+9                  0  0   1
+10                 0  0   1
+11                 0  0   1
+12                 1  0   0
+13                 0  0   1
+14                 0  0   1
+15                 0  0   1
+16                 1  0   0
+17                 1  0   0
+18                 1  0   0
+19                 0  0   1
+20                 0  0   1
+21                 0  0   1
+22                 0  0   1
+23                 0  0   1
+24                 0  0   1
+25                 0  0   1
+26                 1  0   0
+27                 0  0   1
+28                 0  0   1
+29                 1  0   0
+30                 0  0   1
+31                 0  0   1
+32                 1  0   0
+33                 0  0   1
+34                 0  0   1
+35                 1  0   0
+36                 0  0   1
+37                 0  0   1
+38                 0  0   1
+39                 0  0   1
+40                 0  0   1
+41                 0  0   1
+42                 1  0   1
+43                 0  0   2
+44                 0  0   2
+45                 1  0   9
+46                 0  0   6
+47                 0  0   2
+48                 1  0  10
+49                 0  0  19
+50                 0  0   1
+51                 0  0   1
+52                 0  0   1
+53                 1  0   0
+54                 0  0   1
+55                 1  0   0
+56                 3  0   8
+57                 0  0   1
+58                 0  0   1
+59                 0  0   1
+60                 0  0   1
+61                 1  0   0
+62                 0  0   1
+63                 0  1   0
+64                 0  0   1
+65                 0  0   1
+66                 0  0   1
+67                 0  0   1
+68                 1  0   0
+69                 0  0   1
+70                 0  1   0
+71                 1  0   0
+72                 0  0   1
+73                 1  0   0
+74                 1  0   0
+75                 1  0   0
+76                 1  0   0
+77                 1  0   0
+78                 1  0   0
+79                 0  0   1
+80                 0  0   1
+81                 0  0   1
+82                 1  0   0
+83                 1  0   0
+84                 0  0   1
+85                 1  0   0
+86                 0  0   1
+87                 0  0   1
+88                 0  0   1
+89                 0  0   1
+90                 0  0   1
+91                 0  0   1
+  -> figures/behaviour_scatter.png
+
+========================================================================
+TIME AND MARKET REGIME
+========================================================================
+every number elsewhere in this report is a yearly average.
+this section splits the year, because an average hides the episodes.
+
+  regime bars: calm 1,079, normal 1,079, stressed 1,092
+  (terciles of 5-day realised volatility of an equal-weighted index)
+
+========================================================================
+OVERLAP BY MARKET REGIME
+========================================================================
+          claude  gemini     gpt  popular  random   cross
+regime                                                   
+calm      0.2022  0.1246  0.2254   0.0148  0.0125  0.0461
+normal    0.1870  0.1195  0.2053   0.0145  0.0121  0.0420
+stressed  0.1935  0.1304  0.2046   0.0145  0.0114  0.0440
+  -> csv/overlap_by_regime.csv
+
+========================================================================
+OVERLAP BY MONTH
+========================================================================
+         claude  gemini     gpt  popular  random   cross
+month                                                   
+2025-01  0.2067  0.1222  0.2062   0.0142  0.0107  0.0442
+2025-02  0.2005  0.1237  0.2167   0.0143  0.0105  0.0439
+2025-03  0.1827  0.1203  0.1881   0.0146  0.0104  0.0399
+2025-04  0.1905  0.1443  0.2075   0.0145  0.0106  0.0436
+2025-05  0.1976  0.1266  0.2088   0.0148  0.0107  0.0448
+2025-06  0.1956  0.1273  0.2224   0.0140  0.0105  0.0462
+2025-07  0.1908  0.1152  0.2059   0.0153  0.0130  0.0426
+2025-08  0.1822  0.1202  0.1977   0.0147  0.0134  0.0422
+2025-09  0.2222  0.1298  0.2376   0.0150  0.0128  0.0507
+2025-10  0.1999  0.1326  0.2265   0.0147  0.0133  0.0462
+2025-11  0.1809  0.1196  0.1967   0.0146  0.0132  0.0405
+2025-12  0.1818  0.1159  0.2241   0.0145  0.0146  0.0431
+  -> csv/overlap_by_month.csv
+  -> csv/overlap_timeseries.csv
+
+========================================================================
+PEAK CROWDING BARS
+========================================================================
+
+  claude: top 10 bars, mean 0.1943, peak 0.3630
+    dates: 2025-04-04, 2025-09-15
+    regimes: {'stressed': 10}
+
+  gemini: top 10 bars, mean 0.1248, peak 0.3117
+    dates: 2025-04-04, 2025-04-21, 2025-05-22
+    regimes: {'stressed': 10}
+
+  gpt: top 10 bars, mean 0.2117, peak 0.3917
+    dates: 2025-04-04, 2025-04-08, 2025-04-09, 2025-10-08
+    regimes: {'stressed': 6, 'calm': 4}
+
+  popular: top 10 bars, mean 0.0146, peak 0.0228
+    dates: 2025-03-14, 2025-04-17, 2025-04-23, 2025-05-29, 2025-06-11, 2025-06-12, 2025-07-01, 2025-11-05, 2025-12-02
+    regimes: {'stressed': 4, 'calm': 4, 'normal': 2}
+
+  random: top 10 bars, mean 0.0120, peak 0.0179
+    dates: 2025-07-10, 2025-12-26, 2025-12-29, 2025-12-30, 2025-12-31
+    regimes: {'calm': 10}
+
+========================================================================
+FLOW IMBALANCE BY MARKET REGIME
+========================================================================
+if agents herd harder under stress, it shows here and nowhere else
+
+          claude  gemini     gpt  popular  random
+regime                                           
+calm      0.9190  0.7553  0.9612   0.8498  0.9159
+normal    0.9239  0.7598  0.9645   0.8454  0.9155
+stressed  0.9275  0.7437  0.9628   0.8501  0.9181
+  -> csv/flow_by_regime.csv
+
+========================================================================
+SIMULTANEOUS RISK-OFF
+========================================================================
+fraction of the population holding nothing at all, per bar
+a spike means many agents went to cash at the same moment
+
+  claude   mean 0.0248  max 0.0333  bars with >50% flat: 0
+  gemini   mean 0.0060  max 0.2500  bars with >50% flat: 0
+  gpt      mean 0.0342  max 0.6207  bars with >50% flat: 5
+  popular  mean 0.0003  max 1.0000  bars with >50% flat: 1
+  random   mean 0.0003  max 1.0000  bars with >50% flat: 1
+  -> csv/flat_fraction_timeseries.csv
+  -> figures/overlap_over_time.png
+
+========================================================================
+RETURNS -- SIDE ANALYSIS, NOT A HEADLINE
+========================================================================
+the contract states zero commission and zero slippage, so these are
+gross by construction. an agent that trades constantly looks far
+better here than it would anywhere real. kept because it is
+interesting, excluded from every conclusion.
+
+         total_return  benchmark_return  excess_vs_benchmark  sharpe  ann_vol  max_drawdown  shares_traded  net_ret_5mils  net_ret_10mils  net_ret_20mils
+model                                                                                                                                                    
+claude         0.1079            0.1077               0.0002  0.1967   0.2041       -0.2325   6.773935e+05         0.0740          0.0402         -0.0276
+gemini         0.1647            0.1077               0.0570  0.4917   0.1825       -0.1877   2.344798e+06         0.0474         -0.0698         -0.3043
+gpt            0.1364            0.1077               0.0287  0.3340   0.1912       -0.2106   6.010073e+05         0.1063          0.0763          0.0162
+popular        0.1698            0.1077               0.0621  0.8153   0.2199       -0.2120   3.433411e+06        -0.0018         -0.1735         -0.5168
+random         0.1041            0.1077              -0.0036  0.5903   0.1944       -0.1872   2.328794e+06        -0.0123         -0.1288         -0.3617
+
+  84/150 agents lose money at one cent per share traded
+  -> csv/agent_summary.csv
+  -> figures/cost_sensitivity.png
+
+========================================================================
+DONE
+========================================================================
+  report/summary.txt   everything printed above
+  report/csv/          26 tables
+  report/figures/      10 plots
+
+========================================================================
+REPORT -- flow -- 2026-08-17 11:08
+========================================================================
+loading tape and reconstructing positions...
+  agent_001
+  agent_002
+  agent_003
+  agent_004
+  agent_005
+  agent_006
+  agent_007
+  agent_008
+  agent_009
+  agent_010
+  agent_011
+  agent_012
+  agent_013
+  agent_014
+  agent_015
+  agent_016
+  agent_017
+  agent_018
+  agent_019
+  agent_020
+  agent_021
+  agent_022
+  agent_023
+  agent_024
+  agent_025
+  agent_026
+  agent_027
+  agent_028
+  agent_029
+  agent_030
+  gemini_001
+  gemini_002
+  gemini_003
+  gemini_004
+  gemini_005
+  gemini_006
+  gemini_007
+  gemini_008
+  gemini_009
+  gemini_010
+  gemini_011
+  gemini_012
+  gemini_013
+  gemini_014
+  gemini_015
+  gemini_016
+  gemini_017
+  gemini_018
+  gemini_019
+  gemini_020
+  gemini_021
+  gemini_022
+  gemini_023
+  gemini_024
+  gemini_025
+  gemini_026
+  gemini_027
+  gemini_028
+  gemini_029
+  gemini_030
+  gpt_001
+  gpt_002
+  gpt_003
+  gpt_004
+  gpt_005
+  gpt_006
+  gpt_007
+  gpt_008
+  gpt_009
+  gpt_010
+  gpt_011
+  gpt_012
+  gpt_013
+  gpt_014
+  gpt_015
+  gpt_016
+  gpt_017
+  gpt_018
+  gpt_019
+  gpt_020
+  gpt_021
+  gpt_022
+  gpt_023
+  gpt_024
+  gpt_025
+  gpt_026
+  gpt_027
+  gpt_028
+  gpt_029
+  gpt_030
+  popular_001
+  popular_002
+  popular_003
+  popular_004
+  popular_005
+  popular_006
+  popular_007
+  popular_008
+  popular_009
+  popular_010
+  popular_011
+  popular_012
+  popular_013
+  popular_014
+  popular_015
+  popular_016
+  popular_017
+  popular_018
+  popular_019
+  popular_020
+  popular_021
+  popular_022
+  popular_023
+  popular_024
+  popular_025
+  popular_026
+  popular_027
+  popular_028
+  popular_029
+  popular_030
+  random_001
+  random_002
+  random_003
+  random_004
+  random_005
+  random_006
+  random_007
+  random_008
+  random_009
+  random_010
+  random_011
+  random_012
+  random_013
+  random_014
+  random_015
+  random_016
+  random_017
+  random_018
+  random_019
+  random_020
+  random_021
+  random_022
+  random_023
+  random_024
+  random_025
+  random_026
+  random_027
+  random_028
+  random_029
+  random_030
+
+150 agents | 3,250 scored bars | 486 tickers
+models: claude 30, gemini 30, gpt 30, popular 30, random 30
+
+========================================================================
+POPULATION SIGNED FLOW
+========================================================================
+Do agents push the same direction at the same moment, or cancel out?
+For one ticker in one bar: net = buys minus sells across the group,
+gross = all trading ignoring direction. imbalance = |net| / gross.
+1.0 = everyone traded the same way   0.0 = perfectly offsetting
+
+Weighted by (m - 1), where m is how many agents traded that ticker-bar,
+so a ticker-bar with 20 participants counts 19x a ticker-bar with 2.
+Ticker-bars with fewer than 2 traders are dropped: a
+lone agent has nobody to disagree with and scores 1.0 automatically,
+which measures how thinly trading is spread, not whether agents herd.
+
+ticker-bars by number of participating agents (whole population):
+    1 (dropped)    378,813  (48.7%)
+    2              176,711  (22.7%)
+    3-5            154,796  (19.9%)
+    6-10            45,558  ( 5.9%)
+    11+             21,665  ( 2.8%)
+  398,730 of 777,543 ticker-bars used (51.3%)
+
+  ALL      observed 0.5669   (whole population; no null --
+           shuffling everyone into one group reproduces it exactly)
+
+  claude   observed 0.7533  null 0.6995  gate 0.7432  p 0.01597  z  1.96  PASS
+  gemini   observed 0.6554  null 0.7002  gate 0.7495  p 0.94611  z -1.56  fail
+  gpt      observed 0.7725  null 0.6998  gate 0.7438  p 0.00399  z  2.62  PASS
+  popular  observed 0.5906  null 0.7003  gate 0.7407  p 1.00000  z -4.20  fail
+  random   observed 0.5793  null 0.7025  gate 0.7463  p 1.00000  z -4.47  fail
+  -> csv/flow_imbalance.csv
+
+If a synthetic random group is in the pool, compare against it: that
+is what this metric reads when nothing links the agents' decisions.
+
+========================================================================
+FLOW IMBALANCE OVER TIME
+========================================================================
+  claude   mean 0.8446  sd 0.1331  min 0.1667  max 1.0000  bars measurable: 1,404/3,250
+  gemini   mean 0.6561  sd 0.0877  min 0.3238  max 0.9478  bars measurable: 3,250/3,250
+  gpt      mean 0.8129  sd 0.1216  min 0.2979  max 1.0000  bars measurable: 818/3,250
+  popular  mean 0.5942  sd 0.1787  min 0.0045  max 1.0000  bars measurable: 3,148/3,250
+  random   mean 0.5684  sd 0.1004  min 0.0914  max 1.0000  bars measurable: 1,950/3,250
+  -> csv/flow_timeseries.csv
+  -> figures/flow_imbalance.png
+
+========================================================================
+DONE
+========================================================================
+  report/summary.txt   everything printed above
+  report/csv/          26 tables
+  report/figures/      10 plots
+
+========================================================================
+REPORT -- flow -- 2026-08-17 19:47
+========================================================================
+loading tape and reconstructing positions...
+  agent_001
+  agent_002
+  agent_003
+  agent_004
+  agent_005
+  agent_006
+  agent_007
+  agent_008
+  agent_009
+  agent_010
+  agent_011
+  agent_012
+  agent_013
+  agent_014
+  agent_015
+  agent_016
+  agent_017
+  agent_018
+  agent_019
+  agent_020
+  agent_021
+  agent_022
+  agent_023
+  agent_024
+  agent_025
+  agent_026
+  agent_027
+  agent_028
+  agent_029
+  agent_030
+  gemini_001
+  gemini_002
+  gemini_003
+  gemini_004
+  gemini_005
+  gemini_006
+  gemini_007
+  gemini_008
+  gemini_009
+  gemini_010
+  gemini_011
+  gemini_012
+  gemini_013
+  gemini_014
+  gemini_015
+  gemini_016
+  gemini_017
+  gemini_018
+  gemini_019
+  gemini_020
+  gemini_021
+  gemini_022
+  gemini_023
+  gemini_024
+  gemini_025
+  gemini_026
+  gemini_027
+  gemini_028
+  gemini_029
+  gemini_030
+  gpt_001
+  gpt_002
+  gpt_003
+  gpt_004
+  gpt_005
+  gpt_006
+  gpt_007
+  gpt_008
+  gpt_009
+  gpt_010
+  gpt_011
+  gpt_012
+  gpt_013
+  gpt_014
+  gpt_015
+  gpt_016
+  gpt_017
+  gpt_018
+  gpt_019
+  gpt_020
+  gpt_021
+  gpt_022
+  gpt_023
+  gpt_024
+  gpt_025
+  gpt_026
+  gpt_027
+  gpt_028
+  gpt_029
+  gpt_030
+  popular_001
+  popular_002
+  popular_003
+  popular_004
+  popular_005
+  popular_006
+  popular_007
+  popular_008
+  popular_009
+  popular_010
+  popular_011
+  popular_012
+  popular_013
+  popular_014
+  popular_015
+  popular_016
+  popular_017
+  popular_018
+  popular_019
+  popular_020
+  popular_021
+  popular_022
+  popular_023
+  popular_024
+  popular_025
+  popular_026
+  popular_027
+  popular_028
+  popular_029
+  popular_030
+  random_001
+  random_002
+  random_003
+  random_004
+  random_005
+  random_006
+  random_007
+  random_008
+  random_009
+  random_010
+  random_011
+  random_012
+  random_013
+  random_014
+  random_015
+  random_016
+  random_017
+  random_018
+  random_019
+  random_020
+  random_021
+  random_022
+  random_023
+  random_024
+  random_025
+  random_026
+  random_027
+  random_028
+  random_029
+  random_030
+
+150 agents | 3,250 scored bars | 486 tickers
+models: claude 30, gemini 30, gpt 30, popular 30, random 30
+
+========================================================================
+POPULATION SIGNED FLOW
+========================================================================
+Do agents push the same direction at the same moment, or cancel out?
+For one ticker in one bar: net = buys minus sells across the group,
+gross = all trading ignoring direction. imbalance = |net| / gross.
+1.0 = everyone traded the same way   0.0 = perfectly offsetting
+
+Weighted by (m - 1), where m is how many agents traded that ticker-bar,
+so a ticker-bar with 20 participants counts 19x a ticker-bar with 2.
+Ticker-bars with fewer than 2 traders are dropped: a
+lone agent has nobody to disagree with and scores 1.0 automatically,
+which measures how thinly trading is spread, not whether agents herd.
+
+ticker-bars by number of participating agents (whole population):
+    1 (dropped)    378,813  (48.7%)
+    2              176,711  (22.7%)
+    3-5            154,796  (19.9%)
+    6-10            45,558  ( 5.9%)
+    11+             21,665  ( 2.8%)
+  398,730 of 777,543 ticker-bars used (51.3%)
+
+  ALL      observed 0.5669   (whole population; no null --
+           shuffling everyone into one group reproduces it exactly)
+
+  claude   observed 0.7533  null 0.6995  gate 0.7432  p 0.01597  z  1.96  PASS
+  gemini   observed 0.6554  null 0.7002  gate 0.7495  p 0.94611  z -1.56  fail
+  gpt      observed 0.7725  null 0.6998  gate 0.7438  p 0.00399  z  2.62  PASS
+  popular  observed 0.5906  null 0.7003  gate 0.7407  p 1.00000  z -4.20  fail
+  random   observed 0.5793  null 0.7025  gate 0.7463  p 1.00000  z -4.47  fail
+  -> csv/flow_imbalance.csv
+
+If a synthetic random group is in the pool, compare against it: that
+is what this metric reads when nothing links the agents' decisions.
+
+========================================================================
+FLOW IMBALANCE OVER TIME
+========================================================================
+  claude   mean 0.8446  sd 0.1331  min 0.1667  max 1.0000  bars measurable: 1,404/3,250
+  gemini   mean 0.6561  sd 0.0877  min 0.3238  max 0.9478  bars measurable: 3,250/3,250
+  gpt      mean 0.8129  sd 0.1216  min 0.2979  max 1.0000  bars measurable: 818/3,250
+  popular  mean 0.5942  sd 0.1787  min 0.0045  max 1.0000  bars measurable: 3,148/3,250
+  random   mean 0.5684  sd 0.1004  min 0.0914  max 1.0000  bars measurable: 1,950/3,250
+  -> csv/flow_timeseries.csv
+  -> figures/flow_imbalance.png
+
+========================================================================
+DONE
+========================================================================
+  report/summary.txt   everything printed above
+  report/csv/          26 tables
+  report/figures/      10 plots

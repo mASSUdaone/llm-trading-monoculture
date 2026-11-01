@@ -1,0 +1,13 @@
+{
+  "index": 10,
+  "provider": "google",
+  "model": "gemini-3.6-flash",
+  "temperature": 1.0,
+  "max_output_tokens": 40000,
+  "finish_reason": "FinishReason.STOP",
+  "input_tokens": 465,
+  "output_tokens": 3479,
+  "prompt_sha256": "b382a0a3925df2a2a1983562b87c949ee024ff5717ee7273868b856c7a431da8",
+  "fenced": true,
+  "chars": 10107
+}

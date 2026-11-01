@@ -1,0 +1,336 @@
+```python
+from collections import deque
+import math
+import numpy as np
+
+# Internal state. Nothing is executed at import time.
+_state = None
+
+
+def init(cash):
+    """
+    Initialize the strategy state.
+
+    The strategy:
+    - Holds up to 6 liquid assets with strong medium-term momentum.
+    - Requires price above 50- and 100-bar moving averages.
+    - Rebalances every 5 bars.
+    - Uses approximately 92% of portfolio value, retaining a cash buffer.
+    - Exits positions on trend breaks or meaningful drawdowns.
+    - Internally reconstructs fills using the next bar's open.
+    """
+    global _state
+
+    _state = {
+        "cash": float(cash),
+        "positions": {},          # ticker -> integer shares
+        "pending_orders": [],     # orders submitted on prior bar
+        "prices": {},             # last known close
+        "series": {},             # ticker -> deque of closes
+        "volumes": {},            # ticker -> deque of volumes
+        "step": 0,
+    }
+
+
+def _finite_positive(x):
+    try:
+        return math.isfinite(float(x)) and float(x) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _apply_previous_fills(current_open_prices):
+    """
+    Reconstruct execution of orders returned on the preceding call.
+
+    Orders execute at this bar's open. The simulator's documented behavior
+    discards any unfilled remainder, so pending orders are always cleared.
+    """
+    global _state
+
+    pending = _state["pending_orders"]
+
+    for ticker, direction, requested_size in pending:
+        price = current_open_prices.get(ticker)
+
+        # No price available on the execution bar means no fill.
+        if not _finite_positive(price):
+            continue
+
+        price = float(price)
+        requested_size = int(requested_size)
+
+        if direction == "SELL":
+            held = int(_state["positions"].get(ticker, 0))
+            filled = min(held, requested_size)
+
+            if filled > 0:
+                _state["positions"][ticker] = held - filled
+                _state["cash"] += filled * price
+
+                if _state["positions"][ticker] <= 0:
+                    _state["positions"].pop(ticker, None)
+
+        elif direction == "BUY":
+            affordable = int(_state["cash"] / price)
+            filled = min(requested_size, affordable)
+
+            if filled > 0:
+                _state["cash"] -= filled * price
+                _state["positions"][ticker] = (
+                    int(_state["positions"].get(ticker, 0)) + filled
+                )
+
+    _state["pending_orders"] = []
+
+
+def _signal_for_ticker(ticker):
+    """
+    Return a momentum score for a ticker, or None if it is unsuitable.
+
+    Uses:
+    - 60-bar and 20-bar momentum
+    - 50-bar and 100-bar trend filters
+    - 20-bar volatility penalty
+    - rolling dollar-volume liquidity filter
+    """
+    closes = _state["series"].get(ticker)
+    volumes = _state["volumes"].get(ticker)
+
+    if closes is None or volumes is None or len(closes) < 101:
+        return None
+
+    c = np.asarray(closes, dtype=float)
+    v = np.asarray(volumes, dtype=float)
+
+    if not np.all(np.isfinite(c[-101:])):
+        return None
+
+    current = c[-1]
+    if current <= 0:
+        return None
+
+    ma50 = float(np.mean(c[-50:]))
+    ma100 = float(np.mean(c[-100:]))
+
+    if ma50 <= 0 or ma100 <= 0:
+        return None
+
+    momentum_20 = current / c[-21] - 1.0
+    momentum_60 = current / c[-61] - 1.0
+
+    returns = np.diff(np.log(c[-21:]))
+    volatility = float(np.std(returns, ddof=1)) if len(returns) > 1 else 0.0
+
+    avg_dollar_volume = float(np.mean(c[-20:] * v[-20:]))
+
+    # Avoid assets that are too illiquid or have unstable pricing.
+    if avg_dollar_volume < 100000.0:
+        return None
+    if volatility <= 0 or not math.isfinite(volatility):
+        return None
+
+    # Trend and momentum requirements. This makes the strategy willing
+    # to remain in cash during broad downtrends.
+    if current <= ma50 or current <= ma100:
+        return None
+    if momentum_60 <= 0:
+        return None
+    if momentum_20 < -0.04:
+        return None
+
+    # Favor persistent momentum, while penalizing unusually volatile names.
+    raw_momentum = 0.70 * momentum_60 + 0.30 * momentum_20
+    risk_adjusted_score = raw_momentum / max(volatility * math.sqrt(20.0), 0.01)
+
+    if not math.isfinite(risk_adjusted_score):
+        return None
+
+    return risk_adjusted_score
+
+
+def _should_exit(ticker):
+    """
+    Fast exit rule used between scheduled rebalances.
+    """
+    closes = _state["series"].get(ticker)
+
+    if closes is None or len(closes) < 60:
+        return False
+
+    c = np.asarray(closes, dtype=float)
+    current = c[-1]
+
+    if not _finite_positive(current):
+        return False
+
+    ma50 = float(np.mean(c[-50:]))
+    high60 = float(np.max(c[-60:]))
+
+    # Exit on a meaningful break below the intermediate trend,
+    # or a 15% drawdown from the trailing 60-bar high.
+    below_trend = current < ma50 * 0.98
+    drawdown_exit = current < high60 * 0.85
+
+    return below_trend or drawdown_exit
+
+
+def on_bar(history):
+    global _state
+
+    if _state is None:
+        raise RuntimeError("init(cash) must be called before on_bar(history).")
+
+    if history is None or len(history) == 0:
+        return []
+
+    # The history is sorted by timestamp then ticker. Find only the latest
+    # timestamp's rows without scanning/grouping the full history.
+    latest_timestamp = history["timestamp"].iloc[-1]
+    first_current_row = history["timestamp"].searchsorted(
+        latest_timestamp, side="left"
+    )
+    current_rows = history.iloc[first_current_row:]
+
+    current_open_prices = {}
+    current_close_prices = set()
+
+    # First reconcile orders submitted on the prior bar.
+    for ticker, open_price, close_price, volume in current_rows[
+        ["ticker", "open", "close", "volume"]
+    ].itertuples(index=False, name=None):
+        if _finite_positive(open_price):
+            current_open_prices[ticker] = float(open_price)
+
+    _apply_previous_fills(current_open_prices)
+
+    # Update rolling data with the closes that have become available.
+    for ticker, open_price, close_price, volume in current_rows[
+        ["ticker", "open", "close", "volume"]
+    ].itertuples(index=False, name=None):
+
+        if not _finite_positive(close_price):
+            continue
+
+        close_price = float(close_price)
+        volume = float(volume) if _finite_positive(volume) else 0.0
+
+        if ticker not in _state["series"]:
+            _state["series"][ticker] = deque(maxlen=130)
+            _state["volumes"][ticker] = deque(maxlen=130)
+
+        _state["series"][ticker].append(close_price)
+        _state["volumes"][ticker].append(volume)
+        _state["prices"][ticker] = close_price
+        current_close_prices.add(ticker)
+
+    _state["step"] += 1
+
+    # Scheduled portfolio rebalance every five bars.
+    rebalance_now = (_state["step"] % 5 == 0)
+
+    targets = {}
+    scores = {}
+
+    if rebalance_now:
+        candidates = []
+
+        for ticker in current_close_prices:
+            score = _signal_for_ticker(ticker)
+            if score is not None:
+                candidates.append((score, ticker))
+
+        candidates.sort(reverse=True)
+        selected = candidates[:6]
+
+        for score, ticker in selected:
+            scores[ticker] = score
+
+        # Estimate equity from current closes. For held tickers missing from
+        # this timestamp, use their last available close.
+        equity = float(_state["cash"])
+
+        for ticker, shares in _state["positions"].items():
+            price = _state["prices"].get(ticker)
+            if _finite_positive(price):
+                equity += int(shares) * float(price)
+
+        if selected and equity > 0:
+            # Keep an 8% strategic cash reserve, then retain a further small
+            # sizing buffer for next-open gaps.
+            allocation_per_name = equity * 0.92 / len(selected)
+
+            for score, ticker in selected:
+                price = _state["prices"].get(ticker)
+
+                if _finite_positive(price):
+                    target_shares = int((allocation_per_name * 0.97) / float(price))
+                    targets[ticker] = max(0, target_shares)
+
+        # Every existing non-selected position should be removed.
+        for ticker in _state["positions"]:
+            targets.setdefault(ticker, 0)
+
+    else:
+        # Between rebalances, only submit risk-reducing exit orders.
+        for ticker, shares in _state["positions"].items():
+            if ticker in current_close_prices and _should_exit(ticker):
+                targets[ticker] = 0
+
+    orders = []
+
+    # Submit sells first. This is important because sale proceeds may fund
+    # buy orders when all orders execute at the next open.
+    estimated_sale_proceeds = 0.0
+
+    for ticker in sorted(targets):
+        held = int(_state["positions"].get(ticker, 0))
+        target = int(targets[ticker])
+
+        if held > target:
+            quantity = held - target
+            orders.append((ticker, "SELL", quantity))
+
+            price = _state["prices"].get(ticker)
+            if _finite_positive(price):
+                estimated_sale_proceeds += quantity * float(price)
+
+    # Use a conservative estimated budget for purchases. The simulator may
+    # partially fill orders after overnight gaps, but this limits that risk.
+    estimated_buy_budget = max(
+        0.0,
+        (_state["cash"] + estimated_sale_proceeds) * 0.95,
+    )
+
+    buy_candidates = []
+
+    for ticker, target in targets.items():
+        held = int(_state["positions"].get(ticker, 0))
+
+        if target > held:
+            score = scores.get(ticker, 0.0)
+            buy_candidates.append((score, ticker, target - held))
+
+    # Higher momentum assets receive priority if available capital is limited.
+    buy_candidates.sort(reverse=True)
+
+    for score, ticker, desired_quantity in buy_candidates:
+        price = _state["prices"].get(ticker)
+
+        if not _finite_positive(price):
+            continue
+
+        price = float(price)
+        affordable_estimate = int(estimated_buy_budget / price)
+        quantity = min(int(desired_quantity), affordable_estimate)
+
+        if quantity > 0:
+            orders.append((ticker, "BUY", quantity))
+            estimated_buy_budget -= quantity * price
+
+    # Save precisely the submitted orders so their fills can be reconstructed
+    # when the platform calls on_bar for the next timestamp.
+    _state["pending_orders"] = list(orders)
+
+    return orders
+```

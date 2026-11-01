@@ -1,0 +1,203 @@
+"""
+A long-only, cash-constrained cross-sectional momentum trader.
+
+Because the platform gives no fill reports, this module keeps its own
+shadow ledger (cash + share positions) and replays the platform's fill
+rule internally (largest affordable/available quantity, executed at the
+*next* bar's open) so that its internal state tracks the real account.
+
+Strategy:
+  - Rolling per-ticker price history (bounded deque) built incrementally.
+  - Every REBALANCE_FREQ bars: rank tickers by skip-recent momentum,
+    keep the positive-momentum leaders, size them by inverse volatility,
+    scale total exposure by market breadth (risk-off when breadth is low).
+  - Between rebalances: hard stop-loss exit on any held name that has
+    drawn down too far from its average cost.
+"""
+
+from collections import deque, defaultdict
+
+import numpy as np
+
+# ----------------------------- parameters -----------------------------
+LOOKBACK = 126          # bars used for momentum / vol estimation
+SKIP = 5                # most-recent bars excluded from momentum calc
+REBALANCE_FREQ = 21     # rebalance every ~21 bars
+MIN_TOP_N = 5
+MAX_TOP_N = 15
+TOP_N_FRACTION = 0.10   # fraction of eligible universe to hold
+BASE_INVEST = 0.95      # max fraction of equity invested when breadth is strong
+MIN_INVEST = 0.15       # min fraction invested when breadth is weak
+STOP_LOSS = 0.15        # exit if price falls 15% below average cost
+DEQUE_LEN = LOOKBACK + SKIP + 5
+
+_state = {}
+
+
+def init(cash):
+    _state.clear()
+    _state['cash'] = float(cash)
+    _state['positions'] = {}                       # ticker -> {'shares': int, 'cost': float}
+    _state['pending_orders'] = []                   # orders to settle at *this* bar's open
+    _state['deques'] = defaultdict(lambda: deque(maxlen=DEQUE_LEN))
+    _state['step'] = -1
+    _state['last_rebalance_step'] = -10 ** 9
+    _state['known_tickers'] = set()
+
+
+def _fill_orders(orders, price_map):
+    """Replay the platform's own fill rule against our shadow ledger."""
+    cash = _state['cash']
+    positions = _state['positions']
+
+    for ticker, direction, size in orders:
+        if size <= 0:
+            continue
+        price = price_map.get(ticker)
+        if price is None or not np.isfinite(price) or price <= 0:
+            continue
+
+        if direction == 'BUY':
+            max_affordable = int(cash // price)
+            qty = min(int(size), max(0, max_affordable))
+            if qty <= 0:
+                continue
+            cost = qty * price
+            cash -= cost
+            pos = positions.get(ticker, {'shares': 0, 'cost': 0.0})
+            new_shares = pos['shares'] + qty
+            pos['cost'] = (pos['cost'] * pos['shares'] + cost) / new_shares
+            pos['shares'] = new_shares
+            positions[ticker] = pos
+
+        elif direction == 'SELL':
+            pos = positions.get(ticker)
+            held = pos['shares'] if pos else 0
+            qty = min(int(size), held)
+            if qty <= 0:
+                continue
+            cash += qty * price
+            pos['shares'] -= qty
+            if pos['shares'] <= 0:
+                positions.pop(ticker, None)
+            else:
+                positions[ticker] = pos
+
+    _state['cash'] = cash
+
+
+def on_bar(history):
+    _state['step'] += 1
+    step = _state['step']
+
+    ts = history['timestamp'].iloc[-1]
+    cur = history[history['timestamp'] == ts]
+
+    open_map = dict(zip(cur['ticker'], cur['open']))
+    close_map = dict(zip(cur['ticker'], cur['close']))
+
+    # 1. Settle orders submitted on the previous bar, at this bar's open.
+    if _state['pending_orders']:
+        _fill_orders(_state['pending_orders'], open_map)
+    _state['pending_orders'] = []
+
+    # 2. Update rolling price history / universe (O(tickers this bar)).
+    known = _state['known_tickers']
+    deques = _state['deques']
+    for t, c in close_map.items():
+        if c is None or not np.isfinite(c) or c <= 0:
+            continue
+        deques[t].append(c)
+        known.add(t)
+
+    positions = _state['positions']
+    new_orders = []
+
+    ready = step >= (LOOKBACK + SKIP)
+    is_rebalance = ready and (step - _state['last_rebalance_step'] >= REBALANCE_FREQ)
+
+    if not is_rebalance:
+        # 3. Stop-loss maintenance between rebalances.
+        for ticker, pos in list(positions.items()):
+            price = close_map.get(ticker)
+            if price is None or not np.isfinite(price):
+                continue
+            if price <= pos['cost'] * (1.0 - STOP_LOSS):
+                new_orders.append((ticker, 'SELL', pos['shares']))
+
+    else:
+        # 4. Full cross-sectional momentum rebalance.
+        candidates = []
+        for t in known:
+            dq = deques.get(t)
+            if dq is None or len(dq) < LOOKBACK + SKIP:
+                continue
+            closes = list(dq)
+            recent = closes[-SKIP - 1]
+            past = closes[-(LOOKBACK + SKIP)]
+            if past <= 0 or recent <= 0:
+                continue
+            mom = recent / past - 1.0
+            window = np.asarray(closes[-LOOKBACK:], dtype=float)
+            rets = np.diff(window) / window[:-1]
+            vol = float(np.std(rets)) if len(rets) > 1 else 0.0
+            candidates.append((t, mom, vol))
+
+        if candidates:
+            moms = np.array([c[1] for c in candidates])
+            breadth = float(np.mean(moms > 0))
+        else:
+            breadth = 0.0
+
+        invest_frac = MIN_INVEST + (BASE_INVEST - MIN_INVEST) * breadth
+
+        top_n = MIN_TOP_N
+        if candidates:
+            top_n = int(max(MIN_TOP_N, min(MAX_TOP_N, len(candidates) * TOP_N_FRACTION)))
+
+        positive = [c for c in candidates if c[1] > 0 and c[0] in close_map]
+        positive.sort(key=lambda c: c[1], reverse=True)
+        selected = positive[:top_n]
+
+        inv_vols = [1.0 / (vol if vol > 1e-4 else 1e-4) for (_, _, vol) in selected]
+        total_inv_vol = sum(inv_vols)
+
+        target_shares = {}
+        if selected and total_inv_vol > 0:
+            portfolio_value = _state['cash']
+            for tk, pos in positions.items():
+                px = close_map.get(tk)
+                if px is None:
+                    dq = deques.get(tk)
+                    px = dq[-1] if dq else 0.0
+                portfolio_value += pos['shares'] * px
+
+            for (t, mom, vol), iv in zip(selected, inv_vols):
+                weight = iv / total_inv_vol
+                dollar_alloc = portfolio_value * invest_frac * weight
+                price = close_map.get(t)
+                if price and price > 0:
+                    shares = int(dollar_alloc // price)
+                    if shares > 0:
+                        target_shares[t] = shares
+
+        new_target_set = set(target_shares.keys())
+
+        # Exit anything no longer in the target basket.
+        for ticker, pos in list(positions.items()):
+            if ticker not in new_target_set:
+                new_orders.append((ticker, 'SELL', pos['shares']))
+
+        # Move existing/new targets to their target size.
+        for ticker, tgt in target_shares.items():
+            held = positions.get(ticker, {'shares': 0})['shares']
+            diff = tgt - held
+            if diff > 0:
+                new_orders.append((ticker, 'BUY', diff))
+            elif diff < 0:
+                new_orders.append((ticker, 'SELL', -diff))
+
+        _state['last_rebalance_step'] = step
+
+    _state['pending_orders'] = list(new_orders)
+    return new_orders

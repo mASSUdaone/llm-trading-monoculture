@@ -1,0 +1,401 @@
+```python
+"""
+Long-only cross-sectional momentum trading agent.
+
+Strategy summary:
+- Tracks close/volume history internally for every ticker.
+- Rebalances every 5 bars after sufficient warm-up.
+- Selects liquid stocks with:
+    * positive medium/long-term momentum
+    * price above its 100-bar moving average
+    * strong risk-adjusted returns
+- Holds up to 8 names, approximately equally weighted.
+- Reduces exposure when broad market breadth is weak.
+- Uses protective exits when a held position breaks trend or falls sharply
+  below its estimated entry price.
+- Internally simulates next-open fills because the platform provides no
+  account statements or fill reports.
+"""
+
+from collections import deque
+import math
+import numpy as np
+
+
+# ----- Module state ---------------------------------------------------------
+
+_cash = 0.0
+_positions = {}          # ticker -> integer shares
+_entry_price = {}        # ticker -> estimated average entry price
+_pending_orders = []     # orders submitted on the preceding bar
+
+_prices = {}             # ticker -> deque of closes
+_volumes = {}            # ticker -> deque of volumes
+_last_price = {}         # ticker -> latest valid close
+_last_seen_bar = {}      # ticker -> bar number of latest observation
+
+_bar_number = 0
+
+LOOKBACK = 140
+REBALANCE_EVERY = 5
+MAX_POSITIONS = 8
+
+
+def init(cash):
+    """Initialize strategy state. Called exactly once by the platform."""
+    global _cash, _positions, _entry_price, _pending_orders
+    global _prices, _volumes, _last_price, _last_seen_bar, _bar_number
+
+    _cash = float(cash)
+    _positions = {}
+    _entry_price = {}
+    _pending_orders = []
+
+    _prices = {}
+    _volumes = {}
+    _last_price = {}
+    _last_seen_bar = {}
+
+    _bar_number = 0
+
+
+def _finite_positive(x):
+    try:
+        return math.isfinite(float(x)) and float(x) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _settle_pending_orders(current_rows):
+    """
+    Reconstruct fills of orders sent at the previous bar.
+
+    Orders execute at this bar's open. Orders are processed in the same
+    sequence returned by this agent; sell orders are intentionally emitted
+    before buy orders.
+    """
+    global _cash, _positions, _entry_price, _pending_orders
+
+    if not _pending_orders:
+        return
+
+    opens = {}
+    for ticker, opn, _close, _volume in current_rows:
+        if _finite_positive(opn):
+            opens[ticker] = float(opn)
+
+    for ticker, direction, requested_size in _pending_orders:
+        open_price = opens.get(ticker)
+
+        # A missing execution-bar price means zero shares fill.
+        if open_price is None or open_price <= 0.0:
+            continue
+
+        if direction == "SELL":
+            held = int(_positions.get(ticker, 0))
+            filled = min(int(requested_size), held)
+
+            if filled > 0:
+                _cash += filled * open_price
+                remaining = held - filled
+
+                if remaining > 0:
+                    _positions[ticker] = remaining
+                else:
+                    _positions.pop(ticker, None)
+                    _entry_price.pop(ticker, None)
+
+        elif direction == "BUY":
+            affordable = int(_cash // open_price)
+            filled = min(int(requested_size), affordable)
+
+            if filled > 0:
+                old_shares = int(_positions.get(ticker, 0))
+                old_entry = float(_entry_price.get(ticker, open_price))
+                new_shares = old_shares + filled
+
+                if old_shares > 0:
+                    _entry_price[ticker] = (
+                        old_entry * old_shares + open_price * filled
+                    ) / new_shares
+                else:
+                    _entry_price[ticker] = open_price
+
+                _positions[ticker] = new_shares
+                _cash -= filled * open_price
+
+    _pending_orders = []
+
+
+def _update_market_data(current_rows):
+    """Append the current bar's close and volume observations to local state."""
+    for ticker, _opn, close, volume in current_rows:
+        if not _finite_positive(close):
+            continue
+
+        close = float(close)
+        vol = float(volume) if _finite_positive(volume) else 0.0
+
+        if ticker not in _prices:
+            _prices[ticker] = deque(maxlen=LOOKBACK)
+            _volumes[ticker] = deque(maxlen=LOOKBACK)
+
+        _prices[ticker].append(close)
+        _volumes[ticker].append(vol)
+        _last_price[ticker] = close
+        _last_seen_bar[ticker] = _bar_number
+
+
+def _ticker_metrics(ticker):
+    """
+    Return momentum/trend/liquidity metrics for a ticker, or None if it does
+    not have enough usable history.
+    """
+    prices_deque = _prices.get(ticker)
+    vols_deque = _volumes.get(ticker)
+
+    if prices_deque is None or len(prices_deque) < 127:
+        return None
+
+    prices = np.asarray(prices_deque, dtype=float)
+    volumes = np.asarray(vols_deque, dtype=float)
+
+    if not np.all(np.isfinite(prices)) or prices[-1] <= 0.0:
+        return None
+
+    close = prices[-1]
+    sma_50 = float(np.mean(prices[-50:]))
+    sma_100 = float(np.mean(prices[-100:]))
+
+    # Approximately 3-month and 6-month momentum.
+    ret_63 = close / prices[-64] - 1.0
+    ret_126 = close / prices[-127] - 1.0
+
+    recent = prices[-22:]
+    returns = recent[1:] / recent[:-1] - 1.0
+    volatility = float(np.std(returns, ddof=1))
+
+    if not math.isfinite(volatility) or volatility < 0.002:
+        volatility = 0.002
+
+    avg_volume = float(np.mean(volumes[-20:]))
+    dollar_volume = close * avg_volume
+
+    return {
+        "close": close,
+        "sma_50": sma_50,
+        "sma_100": sma_100,
+        "ret_63": ret_63,
+        "ret_126": ret_126,
+        "volatility": volatility,
+        "dollar_volume": dollar_volume,
+    }
+
+
+def _portfolio_value():
+    """Estimate current equity using the latest available closing prices."""
+    value = _cash
+    for ticker, shares in _positions.items():
+        price = _last_price.get(ticker)
+        if price is not None and price > 0.0:
+            value += int(shares) * price
+    return value
+
+
+def _protective_exit_orders():
+    """
+    Produce sell orders for holdings that have broken their trend or hit a
+    meaningful drawdown from estimated entry.
+    """
+    orders = []
+
+    for ticker, shares in list(_positions.items()):
+        if shares <= 0:
+            continue
+
+        # Only evaluate stop rules when the ticker traded this bar.
+        if _last_seen_bar.get(ticker) != _bar_number:
+            continue
+
+        prices = _prices.get(ticker)
+        if prices is None or len(prices) < 50:
+            continue
+
+        close = _last_price.get(ticker)
+        if close is None:
+            continue
+
+        entry = _entry_price.get(ticker, close)
+        sma_50 = float(np.mean(np.asarray(prices, dtype=float)[-50:]))
+
+        # Hard loss control plus a medium-term trend break.
+        stop_loss = close < entry * 0.88
+        trend_break = close < sma_50 * 0.96
+
+        if stop_loss or trend_break:
+            orders.append((ticker, "SELL", int(shares)))
+
+    return orders
+
+
+def _rebalance_orders():
+    """Create a full sell-then-buy rebalance order list."""
+    metrics = {}
+    breadth_total = 0
+    breadth_positive = 0
+
+    for ticker in _prices:
+        # Require a current observation; do not trade stale instruments.
+        if _last_seen_bar.get(ticker) != _bar_number:
+            continue
+
+        m = _ticker_metrics(ticker)
+        if m is None:
+            continue
+
+        metrics[ticker] = m
+
+        if m["dollar_volume"] >= 250_000.0:
+            breadth_total += 1
+            if m["close"] > m["sma_100"]:
+                breadth_positive += 1
+
+    if not metrics:
+        return []
+
+    # Market breadth controls total risk. Weak breadth means defensive sizing.
+    breadth = (
+        breadth_positive / breadth_total
+        if breadth_total > 0
+        else 0.0
+    )
+    exposure = 0.90 if breadth >= 0.45 else 0.35
+
+    candidates = []
+    for ticker, m in metrics.items():
+        # Avoid low-priced and illiquid names.
+        if m["close"] < 5.0 or m["dollar_volume"] < 1_000_000.0:
+            continue
+
+        # Long-only trend and momentum filters.
+        if m["close"] <= m["sma_100"]:
+            continue
+        if m["ret_63"] <= 0.0 or m["ret_126"] <= 0.0:
+            continue
+
+        # Risk-adjusted momentum score.
+        score = (0.55 * m["ret_63"] + 0.45 * m["ret_126"]) / m["volatility"]
+        candidates.append((score, ticker))
+
+    candidates.sort(key=lambda x: (-x[0], str(x[1])))
+    selected = [ticker for _, ticker in candidates[:MAX_POSITIONS]]
+
+    equity = _portfolio_value()
+    if equity <= 0.0:
+        return []
+
+    desired = {}
+    if selected:
+        target_value = equity * exposure / len(selected)
+        for ticker in selected:
+            price = metrics[ticker]["close"]
+            desired[ticker] = int(target_value // price)
+
+    sell_orders = []
+    estimated_sale_proceeds = 0.0
+
+    # First reduce or eliminate positions.
+    for ticker, current_shares in list(_positions.items()):
+        wanted = int(desired.get(ticker, 0))
+        if current_shares > wanted:
+            quantity = int(current_shares - wanted)
+            if quantity > 0:
+                sell_orders.append((ticker, "SELL", quantity))
+                mark = _last_price.get(ticker, 0.0)
+                estimated_sale_proceeds += quantity * mark
+
+    # Estimate affordability conservatively from current marks.
+    available_cash = _cash + estimated_sale_proceeds
+    buy_orders = []
+
+    # Buy higher-ranked selections first.
+    for ticker in selected:
+        wanted = int(desired.get(ticker, 0))
+        held = int(_positions.get(ticker, 0))
+        to_buy = wanted - held
+
+        if to_buy <= 0:
+            continue
+
+        price = metrics[ticker]["close"]
+        affordable = int(available_cash // price)
+        quantity = min(to_buy, affordable)
+
+        if quantity > 0:
+            buy_orders.append((ticker, "BUY", int(quantity)))
+            available_cash -= quantity * price
+
+    return sell_orders + buy_orders
+
+
+def on_bar(history):
+    """
+    Called once per timestamp. Return a list of:
+        (ticker, "BUY" or "SELL", positive_integer_share_count)
+    """
+    global _bar_number, _pending_orders
+
+    if history is None or len(history) == 0:
+        return []
+
+    # Rows for the newest timestamp are contiguous because history is sorted
+    # by timestamp, then ticker. searchsorted avoids scanning the whole frame.
+    current_timestamp = history.iloc[-1]["timestamp"]
+    start = int(history["timestamp"].searchsorted(current_timestamp, side="left"))
+    current = history.iloc[start:]
+
+    current_rows = [
+        (ticker, opn, close, volume)
+        for ticker, opn, _high, _low, close, volume in current[
+            ["ticker", "open", "high", "low", "close", "volume"]
+        ].itertuples(index=False, name=None)
+    ]
+
+    _bar_number += 1
+
+    # Previous orders execute at this bar's open before new decisions.
+    _settle_pending_orders(current_rows)
+    _update_market_data(current_rows)
+
+    # Need enough observations for the 126-bar momentum calculation.
+    if _bar_number < 127:
+        return []
+
+    # Rebalance periodically. Between rebalances, only issue risk exits.
+    if _bar_number % REBALANCE_EVERY == 0:
+        orders = _rebalance_orders()
+    else:
+        orders = _protective_exit_orders()
+
+    # Remove malformed/zero orders defensively.
+    cleaned = []
+    seen_sell = set()
+
+    # Avoid duplicate sell orders for the same ticker.
+    for ticker, direction, size in orders:
+        size = int(size)
+        if size <= 0:
+            continue
+
+        if direction == "SELL":
+            if ticker in seen_sell:
+                continue
+            seen_sell.add(ticker)
+
+        cleaned.append((ticker, direction, size))
+
+    # The platform executes these at next bar's open; retain them locally so
+    # cash and positions can be reconstructed on the next invocation.
+    _pending_orders = list(cleaned)
+    return cleaned
+```

@@ -1,0 +1,241 @@
+# Design rationale
+
+Since the platform gives **no fill reports, cash balance, or position statements**, the agent has to be self‑sufficient: it must reproduce the exact fill logic described (largest affordable/available quantity fills at next bar's open, remainder discarded, zero fill if no price) so its internal notion of cash and holdings stays perfectly in sync with what the platform is actually doing. That "shadow ledger" is the backbone of everything else.
+
+On top of that ledger I run a simple, robust, long-only cross-sectional strategy (no shorting/borrowing is allowed, so there's no point designing for it):
+
+* **Signal**: 126-bar momentum (skipping the most recent 5 bars to avoid short-term reversal), computed per ticker from close prices.
+* **Universe filter**: enough history, minimum price, positive momentum only.
+* **Selection**: top-N momentum names (N=10).
+* **Sizing**: inverse-volatility weighting (risk parity flavored) among selected names, capped per-name weight, ~5% cash buffer left un-invested.
+* **Risk overlay**: drawdown from equity peak scales exposure down (halved at -20%, fully to cash at -35%).
+* **Rebalance cadence**: every 10 bars, to keep turnover and order count sane, with a minimum trade-size filter to avoid churning on noise (full exits are always allowed regardless of size).
+* **Execution mechanics**: sells are placed before buys in the returned order list so freed-up cash can be assumed available for buys, matching how the settlement is simulated internally.
+
+Performance: rather than scanning/pivoting the ever-growing `history` frame from scratch every bar (which would be O(n²) overall), the code keeps a running estimate of "rows per timestamp" and only looks at a bounded tail slice, doubling that slice adaptively if it turns out to be too small. This keeps per-bar cost roughly constant regardless of how long the backtest runs.
+
+```python
+import numpy as np
+import pandas as pd
+
+# ------------------------------------------------------------------
+# configuration
+# ------------------------------------------------------------------
+LOOKBACK = 126          # momentum lookback window (bars)
+SKIP = 5                # skip most recent bars (avoid short-term reversal)
+VOL_LOOKBACK = 20        # realized-vol window (bars) for risk weighting
+REBALANCE_PERIOD = 10    # rebalance every N bars
+TOP_N = 10               # max number of concurrent positions
+MAX_WEIGHT = 0.15        # cap on portfolio weight per position
+CASH_BUFFER = 0.05       # fraction of equity always left uninvested
+MIN_PRICE = 1.0          # ignore very low priced / illiquid-looking names
+MIN_TRADE_VALUE = 50.0   # skip rebalancing trades smaller than this $ amount
+DD_SOFT = 0.20           # drawdown level at which exposure is halved
+DD_HARD = 0.35           # drawdown level at which we go to full cash
+
+_state = {}
+
+
+# ------------------------------------------------------------------
+# lifecycle
+# ------------------------------------------------------------------
+def init(cash):
+    _state.clear()
+    _state['cash'] = float(cash)
+    _state['positions'] = {}          # ticker -> int shares held
+    _state['pending_orders'] = []     # orders submitted last bar, to settle now
+    _state['last_price'] = {}         # ticker -> last known close (for valuation)
+    _state['bar_count'] = 0
+    _state['rows_per_ts'] = 1         # adaptive estimate of rows per timestamp
+    _state['equity_peak'] = float(cash)
+
+
+# ------------------------------------------------------------------
+# helpers: bounded-cost slicing of the (append-only, sorted) history
+# ------------------------------------------------------------------
+def _extract_current_rows(history, current_ts):
+    n = len(history)
+    tail_n = min(n, max(_state['rows_per_ts'], 1))
+    rows = history.iloc[-tail_n:]
+    rows = rows[rows['timestamp'] == current_ts]
+    # if the whole slice matched, we may have cut off earlier rows of the
+    # same timestamp -> grow the window and retry
+    while len(rows) == tail_n and tail_n < n:
+        tail_n = min(n, tail_n * 2)
+        tail = history.iloc[-tail_n:]
+        rows = tail[tail['timestamp'] == current_ts]
+    if len(rows) > _state['rows_per_ts']:
+        _state['rows_per_ts'] = len(rows)
+    return rows
+
+
+def _get_lookback_pivot(history, n_ts_needed):
+    n = len(history)
+    eff = max(_state['rows_per_ts'], 1)
+    tail_n = min(n, eff * (n_ts_needed + 2) + 50)
+    while True:
+        tail = history.iloc[-tail_n:]
+        pivot = tail.pivot_table(index='timestamp', columns='ticker', values='close')
+        if len(pivot) >= n_ts_needed or tail_n >= n:
+            break
+        tail_n = min(n, tail_n * 2)
+    pivot = pivot.sort_index()
+    return pivot.tail(n_ts_needed)
+
+
+# ------------------------------------------------------------------
+# helper: reproduce the platform's exact fill logic on our own ledger
+# ------------------------------------------------------------------
+def _settle_pending(open_prices):
+    cash = _state['cash']
+    positions = _state['positions']
+
+    for ticker, direction, size in _state['pending_orders']:
+        price = open_prices.get(ticker)
+        if price is None or not np.isfinite(price) or price <= 0:
+            continue  # no price available -> fills for zero shares
+
+        if direction == 'BUY':
+            if cash <= 0:
+                continue
+            affordable = int(cash // price)
+            qty = min(size, affordable)
+            if qty > 0:
+                cash -= qty * price
+                positions[ticker] = positions.get(ticker, 0) + qty
+
+        elif direction == 'SELL':
+            held = positions.get(ticker, 0)
+            qty = min(size, held)
+            if qty > 0:
+                cash += qty * price
+                remaining = held - qty
+                if remaining > 0:
+                    positions[ticker] = remaining
+                else:
+                    positions.pop(ticker, None)
+
+    _state['cash'] = cash
+    _state['pending_orders'] = []
+
+
+# ------------------------------------------------------------------
+# main callback
+# ------------------------------------------------------------------
+def on_bar(history):
+    current_ts = history['timestamp'].iloc[-1]
+    current_rows = _extract_current_rows(history, current_ts)
+
+    open_prices = dict(zip(current_rows['ticker'], current_rows['open']))
+    close_prices = dict(zip(current_rows['ticker'], current_rows['close']))
+
+    # 1) settle whatever we submitted on the previous bar, at this bar's open
+    _settle_pending(open_prices)
+
+    # 2) refresh last-known prices (used for valuation / sizing decisions)
+    for t, p in close_prices.items():
+        if np.isfinite(p) and p > 0:
+            _state['last_price'][t] = p
+
+    _state['bar_count'] += 1
+
+    # 3) mark-to-market equity & drawdown control
+    positions = _state['positions']
+    cash = _state['cash']
+    equity = cash + sum(
+        sh * _state['last_price'].get(t, 0.0) for t, sh in positions.items()
+    )
+    if equity > _state['equity_peak']:
+        _state['equity_peak'] = equity
+    drawdown = 0.0 if _state['equity_peak'] <= 0 else 1.0 - equity / _state['equity_peak']
+
+    if drawdown >= DD_HARD:
+        exposure_scale = 0.0
+    elif drawdown >= DD_SOFT:
+        exposure_scale = 0.5
+    else:
+        exposure_scale = 1.0
+
+    orders = []
+    n_needed = LOOKBACK + SKIP + VOL_LOOKBACK + 5
+    enough_history = _state['bar_count'] > n_needed
+
+    if enough_history and _state['bar_count'] % REBALANCE_PERIOD == 0:
+        pivot = _get_lookback_pivot(history, n_needed)
+
+        if len(pivot) >= n_needed:
+            last_idx = len(pivot) - 1
+            mom_now_idx = last_idx - SKIP
+            mom_then_idx = mom_now_idx - LOOKBACK
+
+            if mom_then_idx >= 0:
+                p_now = pivot.iloc[mom_now_idx]
+                p_then = pivot.iloc[mom_then_idx]
+                momentum = (p_now / p_then) - 1.0
+
+                returns = pivot.pct_change().tail(VOL_LOOKBACK)
+                vol = returns.std()
+
+                current_price = pivot.iloc[last_idx]
+
+                candidates = pd.DataFrame({
+                    'momentum': momentum,
+                    'vol': vol,
+                    'price': current_price,
+                }).dropna()
+
+                candidates = candidates[
+                    (candidates['momentum'] > 0) &
+                    (candidates['vol'] > 1e-6) &
+                    (candidates['price'] >= MIN_PRICE)
+                ]
+
+                candidates = candidates.sort_values('momentum', ascending=False).head(TOP_N)
+
+                target_weights = {}
+                if len(candidates) > 0:
+                    inv_vol = 1.0 / candidates['vol']
+                    weights = inv_vol / inv_vol.sum()
+                    weights = weights.clip(upper=MAX_WEIGHT)
+                    if weights.sum() > 0:
+                        weights = weights / weights.sum() * (1.0 - CASH_BUFFER)
+                    weights = weights * exposure_scale
+                    target_weights = weights.to_dict()
+
+                target_shares = {}
+                for ticker, w in target_weights.items():
+                    price = _state['last_price'].get(ticker)
+                    if price and price > 0:
+                        target_shares[ticker] = int((equity * w) // price)
+
+                all_tickers = set(target_shares) | set(positions.keys())
+                sell_orders = []
+                buy_orders = []
+                for ticker in all_tickers:
+                    tgt = target_shares.get(ticker, 0)
+                    cur = positions.get(ticker, 0)
+                    diff = tgt - cur
+                    if diff == 0:
+                        continue
+                    price = _state['last_price'].get(ticker)
+                    if price is None or price <= 0:
+                        continue
+                    # skip tiny rebalancing noise, but always allow full exits
+                    if tgt != 0 and abs(diff) * price < MIN_TRADE_VALUE:
+                        continue
+                    if diff < 0:
+                        sell_orders.append((ticker, 'SELL', int(-diff)))
+                    else:
+                        buy_orders.append((ticker, 'BUY', int(diff)))
+
+                # sells first so freed-up cash is available for buys
+                orders = sell_orders + buy_orders
+
+    _state['pending_orders'] = orders
+    return orders
+```
+
+### How it behaves
+- **Idle bars** (most of them): just settle prior orders, update the internal ledger, return `[]`.
+- **Rebalance bars** (every 10th bar, once enough history exists): rank tickers by 6-month momentum, keep the top 10 with positive momentum, size them by inverse volatility (capped, ~95% max gross exposure), scale down or flatten entirely under a drawdown, and emit the sell/buy orders needed to move current holdings to the targets.
+- The internal `cash`/`positions` ledger is updated using the **same fill rules** the platform uses, so sizing decisions on later bars are based on an accurate (self-tracked) view of the portfolio even though the platform never reports it back.

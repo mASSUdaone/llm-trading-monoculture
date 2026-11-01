@@ -1,0 +1,15 @@
+{
+  "index": 10,
+  "provider": "openai",
+  "model": "gpt-5.6-terra",
+  "reasoning_effort": "medium",
+  "max_output_tokens": 32000,
+  "status": "completed",
+  "incomplete_reason": null,
+  "input_tokens": 451,
+  "output_tokens": 4930,
+  "reasoning_tokens": 2070,
+  "prompt_sha256": "b382a0a3925df2a2a1983562b87c949ee024ff5717ee7273868b856c7a431da8",
+  "fenced": true,
+  "chars": 12013
+}

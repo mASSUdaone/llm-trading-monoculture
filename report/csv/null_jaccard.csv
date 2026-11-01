@@ -1,0 +1,7 @@
+group,n_agents,observed,null_mean,null_sd,gate_95pct,p_value,z_score,passes,metric
+claude,30,0.1943,0.0594,0.0156,0.0876,0.0002,8.65,True,jaccard
+gemini,30,0.1432,0.0595,0.0157,0.0873,0.0002,5.33,True,jaccard
+gpt,30,0.2264,0.0596,0.0161,0.0886,0.0002,10.36,True,jaccard
+popular,30,0.0146,0.0595,0.0158,0.0877,1.0,-2.84,False,jaccard
+random,30,0.012,0.0594,0.0155,0.0875,1.0,-3.06,False,jaccard
+POOLED,150,0.1159,0.0594,0.0016,0.0622,0.0002,35.99,True,jaccard

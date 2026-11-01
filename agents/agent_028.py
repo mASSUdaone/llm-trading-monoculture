@@ -1,0 +1,213 @@
+import numpy as np
+import pandas as pd
+
+# ----------------------------- strategy constants -----------------------------
+LOOKBACK          = 20     # bars used to compute momentum / volatility
+REBALANCE_PERIOD  = 5      # rebalance the portfolio every N bars
+TOP_N_MAX         = 10     # max number of names held at once
+MAX_WEIGHT        = 0.25   # soft cap on a single name's portfolio weight
+INVESTABLE_FRAC   = 0.95   # keep a small cash buffer
+MIN_HISTORY_FRAC  = 0.7    # ticker must have data for this fraction of the window
+STOP_LOSS_PCT     = 0.10   # sell a position that is down this much from avg cost
+EPS               = 1e-9
+
+STATE = None  # module-level state, populated in init()
+
+
+def init(cash):
+    global STATE
+    STATE = {
+        'cash': float(cash),
+        'positions': {},     # ticker -> shares held (int)
+        'avg_cost': {},      # ticker -> average cost basis (float)
+        'pending_orders': [],# orders submitted last bar, to be filled at this bar's open
+        'timestamps': [],    # ordered list of unique timestamps seen so far
+        'bar_count': 0,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# internal broker simulation
+# --------------------------------------------------------------------------- #
+def _process_fills(s, price_open):
+    """Replay the platform's fill rule for orders queued on the previous bar."""
+    for ticker, direction, size in s['pending_orders']:
+        if size <= 0:
+            continue
+        price = price_open.get(ticker)
+        if price is None or price <= 0 or not np.isfinite(price):
+            continue
+
+        if direction == 'BUY':
+            affordable = int(s['cash'] // price)
+            qty = min(size, affordable)
+            if qty > 0:
+                cost = qty * price
+                s['cash'] -= cost
+                old_qty = s['positions'].get(ticker, 0)
+                old_cost = s['avg_cost'].get(ticker, 0.0)
+                new_qty = old_qty + qty
+                s['avg_cost'][ticker] = (old_cost * old_qty + cost) / new_qty
+                s['positions'][ticker] = new_qty
+
+        elif direction == 'SELL':
+            held = s['positions'].get(ticker, 0)
+            qty = min(size, held)
+            if qty > 0:
+                s['cash'] += qty * price
+                new_qty = held - qty
+                if new_qty <= 0:
+                    s['positions'].pop(ticker, None)
+                    s['avg_cost'].pop(ticker, None)
+                else:
+                    s['positions'][ticker] = new_qty
+
+
+# --------------------------------------------------------------------------- #
+# risk control
+# --------------------------------------------------------------------------- #
+def _stop_loss_orders(s, price_close):
+    orders = []
+    for ticker, qty in list(s['positions'].items()):
+        if qty <= 0:
+            continue
+        price = price_close.get(ticker)
+        cost = s['avg_cost'].get(ticker)
+        if price is None or not cost:
+            continue
+        if price <= cost * (1.0 - STOP_LOSS_PCT):
+            orders.append((ticker, 'SELL', int(qty)))
+    return orders
+
+
+# --------------------------------------------------------------------------- #
+# strategy: volatility-adjusted cross-sectional momentum
+# --------------------------------------------------------------------------- #
+def _rebalance_orders(s, history, price_close):
+    ts_list = s['timestamps']
+    if len(ts_list) < LOOKBACK:
+        return []
+
+    cutoff_ts = ts_list[-LOOKBACK]
+    ts_array = history['timestamp'].to_numpy()
+    idx = np.searchsorted(ts_array, cutoff_ts, side='left')
+    window = history.iloc[idx:]
+
+    pivot = window.pivot_table(index='timestamp', columns='ticker',
+                                values='close', aggfunc='last')
+    if pivot.shape[0] < 2 or pivot.shape[1] == 0:
+        return []
+
+    min_count = max(2, int(LOOKBACK * MIN_HISTORY_FRAC))
+    counts = pivot.notna().sum()
+    valid_cols = counts[counts >= min_count].index
+    pivot = pivot[valid_cols]
+    if pivot.shape[1] == 0:
+        return []
+
+    pivot = pivot.ffill().bfill()
+
+    first = pivot.iloc[0]
+    last = pivot.iloc[-1]
+    momentum = (last / first) - 1.0
+
+    rets = pivot.pct_change().dropna(how='all')
+    vol = rets.std(skipna=True)
+    vol = vol.replace([np.inf, -np.inf], np.nan)
+
+    score = momentum / (vol + EPS)
+    score = score.replace([np.inf, -np.inf], np.nan)
+
+    candidates = score[(momentum > 0) & score.notna() & (vol > 0)]
+    candidates = candidates[candidates.index.isin(price_close.keys())]
+    candidates = candidates.sort_values(ascending=False)
+
+    top_n = min(TOP_N_MAX, len(candidates))
+    if top_n == 0:
+        selected = []
+    else:
+        selected = candidates.index[:top_n].tolist()
+
+    weights = {}
+    if selected:
+        inv_vol = 1.0 / vol[selected].clip(lower=EPS)
+        w = inv_vol / inv_vol.sum()
+
+        eff_cap = max(MAX_WEIGHT, 1.0 / len(selected))
+        for _ in range(6):
+            total = w.sum()
+            if total <= 0:
+                break
+            w = w / total
+            over = w > eff_cap
+            if not over.any():
+                break
+            w[over] = eff_cap
+        weights = w.to_dict()
+
+    portfolio_value = s['cash'] + sum(
+        qty * price_close.get(t, s['avg_cost'].get(t, 0.0))
+        for t, qty in s['positions'].items()
+    )
+    investable = max(portfolio_value, 0.0) * INVESTABLE_FRAC
+
+    target_shares = {}
+    for t, wt in weights.items():
+        price = price_close.get(t)
+        if not price or price <= 0:
+            continue
+        dollar = investable * wt
+        target_shares[t] = int(dollar // price)
+
+    all_tickers = set(target_shares.keys()) | set(s['positions'].keys())
+    sells, buys = [], []
+    for t in all_tickers:
+        cur = s['positions'].get(t, 0)
+        tgt = target_shares.get(t, 0)
+        diff = tgt - cur
+        if diff < 0:
+            sells.append((t, 'SELL', int(-diff)))
+        elif diff > 0:
+            buys.append((t, 'BUY', int(diff)))
+
+    return sells + buys
+
+
+# --------------------------------------------------------------------------- #
+# platform entry point
+# --------------------------------------------------------------------------- #
+def on_bar(history):
+    global STATE
+    s = STATE
+
+    current_ts = history['timestamp'].iloc[-1]
+    current_rows = history[history['timestamp'] == current_ts]
+    price_open = dict(zip(current_rows['ticker'], current_rows['open']))
+    price_close = dict(zip(current_rows['ticker'], current_rows['close']))
+
+    # 1. settle orders queued on the previous call using this bar's open
+    _process_fills(s, price_open)
+    s['pending_orders'] = []
+
+    # 2. bookkeeping
+    if not s['timestamps'] or s['timestamps'][-1] != current_ts:
+        s['timestamps'].append(current_ts)
+    s['bar_count'] += 1
+
+    orders = []
+
+    # 3. risk control every bar
+    try:
+        orders.extend(_stop_loss_orders(s, price_close))
+    except Exception:
+        pass
+
+    # 4. periodic rebalance
+    try:
+        if s['bar_count'] % REBALANCE_PERIOD == 0 and len(s['timestamps']) >= LOOKBACK:
+            orders.extend(_rebalance_orders(s, history, price_close))
+    except Exception:
+        pass
+
+    s['pending_orders'] = orders
+    return orders

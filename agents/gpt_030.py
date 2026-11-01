@@ -1,0 +1,365 @@
+import math
+from collections import deque
+
+import numpy as np
+
+
+# Persistent strategy/account state. init() resets all of this.
+_cash = 0.0
+_positions = {}
+_pending_orders = []
+_seen_rows = 0
+_bar_number = 0
+
+_prices = {}
+_volumes = {}
+_last_price = {}
+_last_seen_bar = {}
+
+
+def init(cash):
+    """
+    Initialize the internal shadow account.
+
+    The platform does not provide fills, positions, or account statements, so
+    this strategy maintains its own account state by replaying its prior orders
+    at the next bar's open.
+    """
+    global _cash, _positions, _pending_orders, _seen_rows, _bar_number
+    global _prices, _volumes, _last_price, _last_seen_bar
+
+    _cash = float(cash)
+    _positions = {}
+    _pending_orders = []
+    _seen_rows = 0
+    _bar_number = 0
+
+    # 140 closes is enough for a 100-bar trend plus 63-bar momentum.
+    _prices = {}
+    _volumes = {}
+    _last_price = {}
+    _last_seen_bar = {}
+
+
+def _valid_positive(value):
+    try:
+        return np.isfinite(value) and float(value) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _update_shadow_account(open_prices):
+    """
+    Replay orders submitted on the previous call.
+
+    Orders are processed in returned order. The strategy deliberately returns
+    sells before buys, matching the desired use of sale proceeds for purchases.
+    """
+    global _cash, _positions, _pending_orders
+
+    if not _pending_orders:
+        return
+
+    for ticker, direction, size in _pending_orders:
+        price = open_prices.get(ticker)
+
+        if not _valid_positive(price):
+            continue
+
+        price = float(price)
+        requested = int(size)
+
+        if requested <= 0:
+            continue
+
+        if direction == "SELL":
+            held = int(_positions.get(ticker, 0))
+            filled = min(requested, held)
+
+            if filled > 0:
+                _positions[ticker] = held - filled
+                _cash += filled * price
+
+                if _positions[ticker] <= 0:
+                    _positions.pop(ticker, None)
+
+        elif direction == "BUY":
+            affordable = int(math.floor((_cash + 1e-9) / price))
+            filled = min(requested, max(0, affordable))
+
+            if filled > 0:
+                _positions[ticker] = int(_positions.get(ticker, 0)) + filled
+                _cash -= filled * price
+
+    # An order exists only for the immediately following bar. If it did not
+    # fill there, the platform discards it, so the shadow account does too.
+    _pending_orders = []
+
+
+def _append_bar(frame):
+    """Append one timestamp's market data to the rolling indicator history."""
+    global _bar_number
+
+    _bar_number += 1
+
+    tickers = frame["ticker"].to_numpy()
+    closes = frame["close"].to_numpy()
+    volumes = frame["volume"].to_numpy()
+
+    for ticker, close, volume in zip(tickers, closes, volumes):
+        if not _valid_positive(close):
+            continue
+
+        ticker = str(ticker)
+        close = float(close)
+
+        if ticker not in _prices:
+            _prices[ticker] = deque(maxlen=140)
+            _volumes[ticker] = deque(maxlen=30)
+
+        _prices[ticker].append(close)
+
+        if _valid_positive(volume):
+            _volumes[ticker].append(float(volume))
+        else:
+            _volumes[ticker].append(0.0)
+
+        _last_price[ticker] = close
+        _last_seen_bar[ticker] = _bar_number
+
+
+def _portfolio_value():
+    """Estimate equity using the latest known adjusted close for each holding."""
+    value = _cash
+
+    for ticker, shares in _positions.items():
+        if shares <= 0:
+            continue
+        price = _last_price.get(ticker)
+        if _valid_positive(price):
+            value += int(shares) * float(price)
+
+    return max(0.0, value)
+
+
+def _build_orders():
+    """
+    Cross-sectional long-only momentum portfolio.
+
+    Selection:
+      * Must have at least 127 observed closes.
+      * Price must be above its 100-bar average.
+      * Rank by volatility-adjusted 63-bar and 21-bar momentum.
+      * Keep the best six liquid names.
+
+    Risk management:
+      * Exposure falls when broad market breadth deteriorates.
+      * Position weights use inverse recent volatility.
+      * Maximum single-name allocation is capped.
+      * Portfolio is revisited every five observed bars.
+    """
+    if _bar_number < 127:
+        return []
+
+    candidates = []
+
+    # Only evaluate tickers observed on the current timestamp. This avoids
+    # initiating positions in stale or temporarily absent symbols.
+    for ticker, seen_bar in _last_seen_bar.items():
+        if seen_bar != _bar_number:
+            continue
+
+        prices_deque = _prices.get(ticker)
+        if prices_deque is None or len(prices_deque) < 127:
+            continue
+
+        p = np.asarray(prices_deque, dtype=float)
+        if not np.all(np.isfinite(p)) or np.any(p <= 0.0):
+            continue
+
+        current = float(p[-1])
+        ma100 = float(np.mean(p[-100:]))
+
+        if current <= ma100:
+            continue
+
+        ret63 = current / float(p[-64]) - 1.0
+        ret21 = current / float(p[-22]) - 1.0
+
+        log_returns = np.diff(np.log(p[-22:]))
+        daily_vol = float(np.std(log_returns, ddof=1))
+
+        if not np.isfinite(daily_vol) or daily_vol < 0.002:
+            daily_vol = 0.002
+
+        vols = _volumes.get(ticker)
+        if vols is not None and len(vols) > 0:
+            avg_dollar_volume = current * float(np.mean(vols))
+        else:
+            avg_dollar_volume = 0.0
+
+        # Risk-adjusted blend of intermediate and shorter momentum.
+        score = (
+            0.70 * ret63 / (daily_vol * math.sqrt(63.0))
+            + 0.30 * ret21 / (daily_vol * math.sqrt(21.0))
+        )
+
+        if np.isfinite(score):
+            candidates.append(
+                {
+                    "ticker": ticker,
+                    "price": current,
+                    "vol": daily_vol,
+                    "score": float(score),
+                    "liquidity": avg_dollar_volume,
+                }
+            )
+
+    if not candidates:
+        # If no instruments remain in an uptrend, request liquidation.
+        orders = []
+        for ticker, shares in _positions.items():
+            if shares > 0:
+                orders.append((ticker, "SELL", int(shares)))
+        return orders
+
+    # Market breadth determines gross exposure. Breadth is measured among
+    # sufficiently seasoned current symbols before selecting the winners.
+    seasoned_current = 0
+    above_trend = 0
+
+    for ticker, seen_bar in _last_seen_bar.items():
+        if seen_bar != _bar_number:
+            continue
+
+        p_deque = _prices.get(ticker)
+        if p_deque is None or len(p_deque) < 100:
+            continue
+
+        p = np.asarray(p_deque, dtype=float)
+        if not np.all(np.isfinite(p)) or np.any(p <= 0.0):
+            continue
+
+        seasoned_current += 1
+        if p[-1] > np.mean(p[-100:]):
+            above_trend += 1
+
+    breadth = (
+        float(above_trend) / float(seasoned_current)
+        if seasoned_current > 0
+        else 0.0
+    )
+
+    if breadth < 0.30:
+        gross_exposure = 0.0
+    elif breadth < 0.45:
+        gross_exposure = 0.45
+    else:
+        gross_exposure = 0.85
+
+    # Limit the ranking universe to relatively liquid securities. This still
+    # works if volume is absent or uniformly zero because all names remain tied.
+    candidates.sort(key=lambda x: x["liquidity"], reverse=True)
+    liquid_count = min(len(candidates), 200)
+    liquid_candidates = candidates[:liquid_count]
+
+    liquid_candidates.sort(key=lambda x: x["score"], reverse=True)
+    selected = liquid_candidates[: min(6, len(liquid_candidates))]
+
+    if gross_exposure <= 0.0 or not selected:
+        orders = []
+        for ticker, shares in _positions.items():
+            if shares > 0:
+                orders.append((ticker, "SELL", int(shares)))
+        return orders
+
+    # Inverse-volatility sizing. A 28% cap prevents an unusually low-volatility
+    # stock from dominating a concentrated portfolio.
+    inv_vol = np.asarray([1.0 / item["vol"] for item in selected], dtype=float)
+    inv_vol_sum = float(inv_vol.sum())
+
+    weights = {}
+    for item, raw_weight in zip(selected, inv_vol):
+        normalized = float(raw_weight / inv_vol_sum)
+        weights[item["ticker"]] = min(0.28, gross_exposure * normalized)
+
+    equity = _portfolio_value()
+    targets = {}
+
+    for item in selected:
+        ticker = item["ticker"]
+        target_dollars = equity * weights.get(ticker, 0.0)
+        target_shares = int(math.floor(target_dollars / item["price"]))
+        targets[ticker] = max(0, target_shares)
+
+    orders = []
+
+    # Sells are deliberately emitted first. That makes available sale proceeds
+    # usable for subsequent buy orders when the platform processes the list.
+    all_tickers = set(_positions) | set(targets)
+
+    for ticker in sorted(all_tickers):
+        current_shares = int(_positions.get(ticker, 0))
+        desired_shares = int(targets.get(ticker, 0))
+
+        if current_shares > desired_shares:
+            orders.append((ticker, "SELL", current_shares - desired_shares))
+
+    for ticker in sorted(all_tickers):
+        current_shares = int(_positions.get(ticker, 0))
+        desired_shares = int(targets.get(ticker, 0))
+
+        if desired_shares > current_shares:
+            orders.append((ticker, "BUY", desired_shares - current_shares))
+
+    return orders
+
+
+def on_bar(history):
+    """
+    Process the newly appended timestamp and optionally produce next-bar orders.
+    """
+    global _seen_rows, _pending_orders
+
+    if history is None or len(history) == 0:
+        return []
+
+    # The history DataFrame is append-only. Reading only the unseen portion
+    # avoids repeatedly rebuilding indicators from the full DataFrame.
+    if len(history) <= _seen_rows:
+        return []
+
+    new_rows = history.iloc[_seen_rows:]
+    _seen_rows = len(history)
+
+    # Normally there is exactly one timestamp in new_rows. Grouping also makes
+    # the implementation robust if an initial call contains multiple bars.
+    groups = list(new_rows.groupby("timestamp", sort=False))
+    if not groups:
+        return []
+
+    # Prior orders execute at this call's current bar open.
+    current_frame = groups[-1][1]
+    open_prices = {}
+
+    for ticker, open_price in zip(
+        current_frame["ticker"].to_numpy(),
+        current_frame["open"].to_numpy(),
+    ):
+        if _valid_positive(open_price):
+            open_prices[str(ticker)] = float(open_price)
+
+    _update_shadow_account(open_prices)
+
+    # Add all newly received bars to the rolling indicator state.
+    for _, frame in groups:
+        _append_bar(frame)
+
+    # Rebalance approximately weekly. The first usable rebalance occurs once
+    # the 127-bar momentum history is available.
+    if _bar_number < 127 or (_bar_number % 5) != 0:
+        return []
+
+    orders = _build_orders()
+    _pending_orders = list(orders)
+    return orders

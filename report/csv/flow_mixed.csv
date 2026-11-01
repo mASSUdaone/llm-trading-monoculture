@@ -1,0 +1,8 @@
+group,agents,imbalance,note
+claude,30,0.7533,
+gemini,30,0.6554,
+gpt,30,0.7725,
+popular,30,0.5906,
+random,30,0.5793,
+mixed 10+10+10,30,0.7169,"mean of 200 draws, 95% range 0.6705-0.7645"
+all LLM pooled,90,0.6484,bigger group -- description only
